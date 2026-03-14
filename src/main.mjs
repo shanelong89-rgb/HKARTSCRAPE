@@ -1,6 +1,7 @@
-// CULTIVE HK Events Apify Actor v2.2
+// CULTIVE HK Events Apify Actor v2.3
+// v2.3: Fixed HK-AGA detail extraction (og:title, Wix selectors, junk filter)
+//       Fixed Eventbrite venue/address concatenation
 // v2.2: Removed Time Out, focused on Eventbrite HK + HK-AGA
-// v2.1: Fixed listing page short-circuit, tag pill extraction
 // Deploy: push to GitHub -> Apify Console -> Rebuild -> Start
 
 import { CheerioCrawler, Dataset } from '@crawlee/cheerio';
@@ -93,13 +94,6 @@ function detectModes(text) {
 }
 
 // ── CULTIVE Field Mapping ────────────────────────────────────
-// Maps source field name variants to CULTIVE import schema:
-//   title <- title|name|eventTitle
-//   date  <- date|startDate|eventDate   venueName <- venueName|venue|locationName|place
-//   image <- image|imageUrl|photo|thumbnail|flyerFront
-//   price <- price|cost|ticketPrice     address <- address|location|fullAddress
-//   lat/lng <- lat/lng|latitude/longitude|geo.*|coordinates.*
-//   artists <- artists (array or comma-separated string)
 
 function mapToCultiveSchema(raw, url) {
   const r = raw || {};
@@ -184,16 +178,49 @@ function extractEventbriteListingLinks($, url) {
 function extractEventbriteDetail($, url) {
   const title = $('h1').first().text().trim() || $('meta[property="og:title"]').attr('content') || '';
   if (!title || title.length < 5) return [];
+
+  // Date: prefer time[datetime], fallback to text pattern
+  let date = $('time').first().attr('datetime') || '';
+  if (!date) {
+    const bodyText = $('body').text();
+    const dateP = bodyText.match(/((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*,\s+\w+\s+\d{1,2}(?:,\s*\d{4})?)/);
+    if (dateP) date = dateP[1];
+  }
+
+  // Venue: extract first text node only, strip trailing region/date
+  let venueName = '';
+  const venueEl = $('[class*="location-info"]').first();
+  if (venueEl.length) {
+    venueName = venueEl.find('p').first().text().trim()
+      || venueEl.find('strong').first().text().trim() || '';
+    // Cut before day-of-week to avoid "VenueCentral, HKIMonday Mar 30..."
+    venueName = venueName.split(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?/)[0].trim();
+    // Remove trailing region codes
+    venueName = venueName.replace(/,?\s*(?:HKI|KOW|NT|NTW)\s*$/, '').trim();
+  }
+
+  // Address: try second <p> inside location-info, clean same way
+  let address = '';
+  if (venueEl.length) {
+    const pEls = venueEl.find('p');
+    if (pEls.length > 1) address = $(pEls[1]).text().trim();
+    if (!address) address = venueEl.text().trim();
+    address = address.split(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?/)[0].trim();
+    if (venueName && address.startsWith(venueName)) address = address.slice(venueName.length).trim();
+  }
+
+  // Price
+  let price = '';
+  $('[class*="conversion-bar"] [class*="price"], [class*="ticket"] [class*="price"]').each((i, el) => {
+    const t = $(el).text().trim();
+    if (t && !price && /\$|HKD|Free|\d/.test(t)) price = t;
+  });
+
   return [mapToCultiveSchema({
     title,
     description: $('meta[property="og:description"]').attr('content') || '',
     image: $('meta[property="og:image"]').attr('content') || '',
-    date: $('time').first().attr('datetime') || tryText($('body'), ['[class*="date"]','time']),
-    time: tryText($('body'), ['[class*="time"]','[class*="event-time"]']),
-    venueName: tryText($('body'), ['[class*="location-info"] p','[class*="venue"]']),
-    address: tryText($('body'), ['[class*="address"]','[class*="venue-address"]']),
-    price: tryText($('body'), ['[class*="ticket-price"]','[class*="price"]']),
-    sourceUrl: url,
+    date, time: '', venueName, address, price, sourceUrl: url,
   }, url)];
 }
 
@@ -211,7 +238,6 @@ function extractHkAgaLinks($, url) {
     const href = $(el).attr('href');
     if (!href) return;
     const full = resolveUrl(href, url);
-    // Only enqueue exhibition detail pages like /exhibitions/123
     if (/hk-aga\.org\/exhibitions\/\d+/.test(full)) {
       links.add(full);
     }
@@ -255,22 +281,69 @@ function extractHkAgaCards($, url) {
 }
 
 function extractHkAgaDetail($, url) {
-  const title = $('h1').first().text().trim() || $('h2').first().text().trim();
-  if (!title || title.length < 3) return [];
+  // HK-AGA uses Wix — titles may be in og:title, h1, h2, h3, or Wix elements
+  const JUNK = ['join','mailing list','subscribe','newsletter','login','sign up','contact','cookie'];
+  function isJunk(t) { const l = t.toLowerCase(); return JUNK.some(j => l.includes(j)) || t.length > 200; }
+
+  // Try og:title first (most reliable on Wix sites), strip site suffix
+  let title = ($('meta[property="og:title"]').attr('content') || '').replace(/\s*[|\-]\s*HK-?AGA.*/i, '').trim();
+  // Fallback to heading elements and Wix-specific selectors
+  if (!title || title.length < 3 || isJunk(title)) {
+    const headings = ['h1','h2','h3','[data-testid="richTextElement"]','.font_2','.font_3','[class*="title"]'];
+    for (const sel of headings) {
+      $(sel).each((i, el) => {
+        if (title && !isJunk(title)) return;
+        const t = $(el).text().trim();
+        if (t && t.length >= 3 && t.length < 200 && !isJunk(t)) title = t;
+      });
+      if (title && !isJunk(title)) break;
+    }
+  }
+  if (!title || title.length < 3 || isJunk(title)) return [];
+
   const body = $('body').text();
-  const dateMatch = body.match(/(\d{1,2}\s+\w{3,9}\s*[-]\s*\d{1,2}\s+\w{3,9},?\s*\d{4})/);
+  // Date patterns: "1 Mar - 15 Apr, 2026" or "until 30 April 2026" or "March 15, 2026"
+  const dateMatch = body.match(/(\d{1,2}\s+\w{3,9}\s*[-\u2013]\s*\d{1,2}\s+\w{3,9},?\s*\d{4})/)
+    || body.match(/until\s+(\d{1,2}\s+\w{3,9},?\s*\d{4})/i)
+    || body.match(/(\w{3,9}\s+\d{1,2},?\s*\d{4})/);
+
+  // Description: try multiple container selectors (Wix uses divs, not article/main)
   let desc = '';
-  $('article p, main p, .content p').each((i, el) => {
-    if (desc.length < 500) { const t = $(el).text().trim(); if (t.length > 20) desc += (desc ? ' ' : '') + t; }
-  });
+  const descSels = ['article p','main p','.content p','[data-testid="richTextElement"] p','div[class*="text"] p','section p','p'];
+  for (const sel of descSels) {
+    $(sel).each((i, el) => {
+      if (desc.length >= 500) return;
+      const t = $(el).text().trim();
+      if (t.length > 30 && !isJunk(t) && t !== title) desc += (desc ? ' ' : '') + t;
+    });
+    if (desc.length > 50) break;
+  }
   if (!desc) desc = $('meta[property="og:description"]').attr('content') || '';
-  const image = $('meta[property="og:image"]').attr('content') || $('article img').first().attr('src') || '';
-  const addrMatch = body.match(/Address:\s*(.+?)(?=\n|Phone:|Email:|$)/i);
+
+  // Image: og:image first, then content images (skip logos/icons)
+  let image = $('meta[property="og:image"]').attr('content') || '';
+  if (!image) {
+    $('article img, main img, section img, [class*="gallery"] img, img[src*="wix"], img').each((i, el) => {
+      if (image) return;
+      const src = $(el).attr('src') || '';
+      if (src && !src.includes('logo') && !src.includes('icon') && !src.includes('avatar')) image = src;
+    });
+  }
+
+  // Address and venue
+  const addrMatch = body.match(/(?:Address|Location)\s*:?\s*([^\n]{10,80})/i);
+  let venue = '';
+  $('[class*="gallery"],[class*="venue"],[class*="location"]').each((i, el) => {
+    if (!venue) { const t = $(el).text().trim(); if (t.length > 2 && t.length < 60) venue = t; }
+  });
+
   return [mapToCultiveSchema({
-    title, date: $('time').first().attr('datetime') || (dateMatch ? dateMatch[1] : ''),
-    venueName: tryText($('body'), ['[class*="gallery"]','[class*="organizer"]','[class*="venue"]']),
-    description: desc, image,
-    address: addrMatch ? addrMatch[1].trim() : tryText($('body'), ['[class*="address"]']),
+    title,
+    date: $('time').first().attr('datetime') || (dateMatch ? dateMatch[1] : ''),
+    venueName: venue,
+    description: desc.slice(0, 500),
+    image,
+    address: addrMatch ? addrMatch[1].trim() : '',
     category: 'Art', modes: ['Indoor'], sourceUrl: url,
   }, url)];
 }
@@ -311,7 +384,7 @@ const crawler = new CheerioCrawler({
       } else if (/\/exhibitions\/\d+/.test(url)) {
         events = extractHkAgaDetail($, url);
       }
-      // else: skip non-exhibition HK-AGA pages (galleries, login, etc.)
+      // else: skip non-exhibition HK-AGA pages
     } else {
       events = extractJsonLdEvents($, url);
     }
