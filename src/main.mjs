@@ -1,10 +1,9 @@
-// CULTIVE HK Events Apify Actor v2.7
-// v2.7: Fix boilerplate-only descs (return ""), artist boilerplate leak,
-//       word-break spacing in descriptions, address-first district detection,
-//       improved artist extraction patterns
-// v2.6: Strip boilerplate from descriptions, date/endDate split, district
-//       normalization, default Free price, lowercase category, artist extraction
-// v2.5: Description extraction from DOM body text + Google Maps coords
+// CULTIVE HK Events Apify Actor v2.8
+// v2.8: Fix HTML entity decoding (use Cheerio .text() not raw HTML regex),
+//       strip nav menu boilerplate ("About Member Galleries..."),
+//       fix word-break spacing via DOM <br> replacement, improved artists
+// v2.7: Boilerplate-only desc→"", artist boilerplate leak, address-first district
+// v2.6: Date/endDate split, district normalization, Free price, artist extraction
 // Deploy: push to GitHub -> Apify Console -> Rebuild -> Start
 
 import { CheerioCrawler, Dataset } from '@crawlee/cheerio';
@@ -52,7 +51,6 @@ function normalizeDate(text) {
   return text;
 }
 
-// Parse date ranges like "20 Mar - 20 May, 2026" into { date, endDate } ISO strings
 function parseDateRange(text) {
   if (!text) return { date: '', endDate: '' };
   const m = text.match(/(\d{1,2})\s+(\w{3,9})\s*[\-\u2013]\s*(\d{1,2})\s+(\w{3,9}),?\s*(\d{4})/);
@@ -64,7 +62,8 @@ function parseDateRange(text) {
   return { date: normalizeDate(text), endDate: '' };
 }
 
-// Normalize HK-AGA uppercase district names to CULTIVE standard
+// ── District mapping ─────────────────────────────────────────
+
 const DISTRICT_MAP = {
   'SOUTHERN': 'Wong Chuk Hang',
   'SAI WAN (WESTERN)': 'Kennedy Town',
@@ -87,87 +86,6 @@ const DISTRICT_MAP = {
   'WONG TAI SIN': 'Wong Tai Sin',
 };
 
-// v2.7: Address-first detection — real exhibition address beats card district label
-function normalizeDistrict(raw, address) {
-  // Priority 1: detect from actual address (most accurate for off-site exhibitions)
-  const fromAddr = detectDistrict(address || '');
-  if (fromAddr) return fromAddr;
-  // Priority 2: map HK-AGA uppercase district labels
-  const upper = (raw || '').trim().toUpperCase();
-  if (DISTRICT_MAP[upper]) return DISTRICT_MAP[upper];
-  // Priority 3: detect from raw district text
-  const fromRaw = detectDistrict(raw || '');
-  if (fromRaw) return fromRaw;
-  return raw || '';
-}
-
-// Boilerplate markers used in both cleanDescription and extractArtists
-const BOILERPLATE_MARKERS = [
-  'Founded in 2012, the Hong Kong Art Gallery Association',
-  'Founded in 2012',
-  '/* real people should not fill this in',
-  'TEMPUS FUGIT',
-];
-
-// v2.7: Strip HK-AGA boilerplate — idx >= 0 catches boilerplate-only descriptions
-function cleanDescription(desc) {
-  if (!desc) return '';
-  let clean = desc;
-  for (const marker of BOILERPLATE_MARKERS) {
-    const idx = clean.indexOf(marker);
-    if (idx >= 0) clean = clean.slice(0, idx);
-  }
-  clean = clean.replace(/\s+/g, ' ').trim();
-  // If after stripping we have less than 20 chars, it's basically empty
-  return clean.length >= 20 ? clean : '';
-}
-
-// v2.7: Extract artist names — strip boilerplate first, multiple patterns
-function extractArtists(desc) {
-  if (!desc) return [];
-  // Strip boilerplate before parsing to prevent contamination
-  let clean = desc;
-  for (const marker of BOILERPLATE_MARKERS) {
-    const idx = clean.indexOf(marker);
-    if (idx >= 0) clean = clean.slice(0, idx);
-  }
-  clean = clean.trim();
-  if (!clean) return [];
-
-  const artists = [];
-
-  // Pattern 1: "Artists presented:" or "Artists:" or "Artists include:"
-  const presented = clean.match(/[Aa]rtists?\s*(?:presented|featured|include|exhibiting)?\s*:\s*([^.\n]+)/);
-  if (presented) {
-    const names = presented[1].split(/,|\band\b/).map(n => n.trim()).filter(n => n.length > 2 && n.length < 60);
-    artists.push(...names);
-  }
-
-  // Pattern 2: "solo exhibition of [Name]" or "[Name]'s solo show/exhibition"
-  if (artists.length === 0) {
-    const solo1 = clean.match(/solo\s+(?:exhibition|show)\s+(?:of|by)\s+([A-Z][\w\s,.-]+?)(?:[,.]|\s+(?:featuring|curated|at|in|from))/i);
-    if (solo1) artists.push(solo1[1].trim());
-    const solo2 = clean.match(/present(?:s|ed)?\s+(?:the\s+)?solo\s+(?:exhibition|show)\s+of\s+([A-Z][\w\s,.-]+?)(?:[,.]|\s*[\u201c"])/i);
-    if (solo2 && artists.length === 0) artists.push(solo2[1].trim());
-  }
-
-  // Pattern 3: "presents [Name]'s" or "present [Name],"
-  if (artists.length === 0) {
-    const presents = clean.match(/present(?:s|ed)?\s+(?:a\s+)?(?:two-person\s+exhibition\s+bringing\s+together\s+)?([A-Z][A-Za-z\s.-]+?)(?:'s|,\s*(?:a|an|the|featuring|curated))/);
-    if (presents) artists.push(presents[1].trim());
-  }
-
-  // Filter: remove any names that still contain boilerplate fragments or are too generic
-  const filtered = artists.filter(a =>
-    a.length > 2 && a.length < 60 &&
-    !a.includes('Founded') && !a.includes('Hong Kong Art Gallery') &&
-    !a.includes('real people') && !a.includes('TEMPUS') &&
-    !/^(the|a|an|this|that|our|their)\s/i.test(a)
-  );
-
-  return filtered;
-}
-
 const HK_DISTRICTS = [
   'Central','Wan Chai','Causeway Bay','Admiralty','Sheung Wan',
   'Tsim Sha Tsui','Mong Kok','Jordan','Sham Shui Po','Kowloon',
@@ -183,6 +101,97 @@ function detectDistrict(text) {
   const lower = text.toLowerCase();
   return HK_DISTRICTS.find(d => lower.includes(d.toLowerCase())) || '';
 }
+
+// v2.7+: Address-first detection beats card district label
+function normalizeDistrict(raw, address) {
+  const fromAddr = detectDistrict(address || '');
+  if (fromAddr) return fromAddr;
+  const upper = (raw || '').trim().toUpperCase();
+  if (DISTRICT_MAP[upper]) return DISTRICT_MAP[upper];
+  const fromRaw = detectDistrict(raw || '');
+  if (fromRaw) return fromRaw;
+  return raw || '';
+}
+
+// ── Boilerplate stripping ────────────────────────────────────
+
+const BOILERPLATE_MARKERS = [
+  'About Member Galleries Art Guide',
+  'Founded in 2012, the Hong Kong Art Gallery Association',
+  'Founded in 2012',
+  '/* real people should not fill this in',
+  'TEMPUS FUGIT',
+];
+
+function cleanDescription(desc) {
+  if (!desc) return '';
+  let clean = desc;
+  for (const marker of BOILERPLATE_MARKERS) {
+    const idx = clean.indexOf(marker);
+    if (idx >= 0) clean = clean.slice(0, idx);
+  }
+  clean = clean.replace(/\s+/g, ' ').trim();
+  return clean.length >= 20 ? clean : '';
+}
+
+// ── Artist extraction ────────────────────────────────────────
+
+function extractArtists(desc) {
+  if (!desc) return [];
+  // Strip boilerplate before parsing
+  let clean = desc;
+  for (const marker of BOILERPLATE_MARKERS) {
+    const idx = clean.indexOf(marker);
+    if (idx >= 0) clean = clean.slice(0, idx);
+  }
+  clean = clean.trim();
+  if (!clean) return [];
+
+  const artists = [];
+
+  // Pattern 1: "Artists presented:" / "Artists:" / "Artists include:"
+  const presented = clean.match(/[Aa]rtists?\s*(?:presented|featured|include|exhibiting)?\s*:\s*([^.\n]+)/);
+  if (presented) {
+    const names = presented[1].split(/,|\band\b/).map(n => n.trim()).filter(n => n.length > 2 && n.length < 60);
+    artists.push(...names);
+  }
+
+  // Pattern 2: "solo exhibition of [Name]" / "solo show by [Name]"
+  if (artists.length === 0) {
+    const solo = clean.match(/solo\s+(?:exhibition|show)\s+(?:of|by)\s+([A-Z][A-Za-z\s.-]+?)(?:[,.]|\s+(?:featuring|curated|at|in|from|\u201c|"))/i);
+    if (solo) {
+      let name = solo[1].trim();
+      // Strip leading qualifiers like "emerging contemporary artist"
+      name = name.replace(/^(?:emerging|established|renowned|contemporary|young|local|international|Korean|Chinese|Japanese|Hong Kong)\s+(?:contemporary\s+)?(?:artist|painter|sculptor|photographer)s?\s+/i, '');
+      if (name.length > 2) artists.push(name.trim());
+    }
+  }
+
+  // Pattern 3: "present(s) [Name]'s" or "[Gallery] presents [Name],"
+  if (artists.length === 0) {
+    const presents = clean.match(/present(?:s|ed)?\s+(?:a\s+)?(?:[a-z]+\s+)?(?:exhibition\s+(?:of|by)\s+)?([A-Z][A-Za-z\s.-]+?)(?:'s|\u2019s|,\s*(?:a|an|the|his|her|featuring|curated))/);
+    if (presents) {
+      let name = presents[1].trim();
+      name = name.replace(/^(?:emerging|established|renowned|contemporary|young|local|international|Korean|Chinese|Japanese|Hong Kong)\s+(?:contemporary\s+)?(?:artist|painter|sculptor|photographer)s?\s+/i, '');
+      if (name.length > 2 && name.length < 50) artists.push(name.trim());
+    }
+  }
+
+  // Filter out title-like matches, boilerplate fragments, generic words
+  const filtered = artists.filter(a =>
+    a.length > 2 && a.length < 60 &&
+    !a.includes('Founded') && !a.includes('Hong Kong Art Gallery') &&
+    !a.includes('real people') && !a.includes('TEMPUS') &&
+    !a.includes('Member Galleries') &&
+    !/^(the|a|an|this|that|our|their|is|are|was)\s/i.test(a) &&
+    // Must look like a name (contains at least one uppercase letter after first char)
+    /[A-Z]/.test(a.slice(1)) || /^[A-Z][a-z]+ [A-Z]/.test(a)
+  );
+
+  return filtered;
+}
+
+// ── Category detection ───────────────────────────────────────
 
 const CATEGORY_KEYWORDS = {
   music: ['concert','music','dj','live band','gig','jazz','orchestra'],
@@ -378,20 +387,27 @@ function extractHkAgaCards($, url) {
   return cards;
 }
 
-// v2.7: Inject spaces for <br> and block tags before text extraction
-function spacedText($, el) {
-  const html = $(el).html() || '';
-  // Replace <br>, </p>, </div>, </li>, </h1-6> with space before extracting text
-  const spaced = html.replace(/<br\s*\/?>/gi, ' ')
-    .replace(/<\/(p|div|li|h[1-6]|span|td|th|blockquote)>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ');
-  return spaced.replace(/\s+/g, ' ').trim();
+// v2.8: Extract text with proper word breaks and entity decoding
+// Uses Cheerio DOM manipulation instead of raw HTML regex
+function safeText($, el) {
+  const $clone = $(el).clone();
+  // Replace <br> with space text nodes so adjacent words don't merge
+  $clone.find('br').replaceWith(' ');
+  // Remove child elements to get only direct text of this node
+  $clone.children().remove();
+  // .text() auto-decodes HTML entities (&#x201c; → ", &amp; → &, etc.)
+  return $clone.text().replace(/\s+/g, ' ').trim();
 }
 
 // Mine HK-AGA detail pages for description, address, coords
 function extractWixData($, url) {
   const result = { description: '', address: '', lat: null, lng: null };
-  const body = $('body').text() || '';
+
+  // v2.8: Get body text with entity decoding for address/coord extraction
+  // Replace <br> globally before getting text
+  const $body = $('body').clone();
+  $body.find('br').replaceWith(' ');
+  const body = $body.text().replace(/\s+/g, ' ') || '';
 
   // ── Address ──
   const addrMatch = body.match(/Address[:\s]+([^\n]+)/i);
@@ -403,10 +419,10 @@ function extractWixData($, url) {
     }
   }
 
-  // ── Description: Strategy A ── v2.7: use spacedText for proper word breaks
+  // ── Description: Strategy A ── v2.8: use safeText for word breaks + entity decode
   const descParts = [];
   $('p, div, span').each((i, el) => {
-    const text = spacedText($, $(el).clone().children().remove().end());
+    const text = safeText($, el);
     if (text.length < 80) return;
     if (/^Address|^Phone|^Email|^Website|^Click here|FILTER|CURRENTLY|UPCOMING/i.test(text)) return;
     if (/^\d{1,2}\s+\w{3,9}\s*[\-\u2013]/.test(text)) return;
@@ -420,7 +436,7 @@ function extractWixData($, url) {
     result.description = unique.join(' ').replace(/\s+/g, ' ').trim();
   }
 
-  // Strategy B: fallback to body text between header and "Click here"/"Address:"
+  // Strategy B: fallback — full body text between header and footer markers
   if (!result.description) {
     const clickIdx = body.indexOf('Click here');
     const addrIdx = body.indexOf('Address');
@@ -437,7 +453,7 @@ function extractWixData($, url) {
     if (ogDesc && ogDesc.length > 30) result.description = ogDesc;
   }
 
-  // ── Coordinates: from Google Maps iframe/embed URL ──
+  // ── Coordinates ──
   $('iframe[src*="maps"], iframe[src*="google"]').each((i, el) => {
     const src = $(el).attr('src') || '';
     const coordMatch = src.match(/(?:q=|@|ll=|center=)([0-9.]+)[,]([0-9.]+)/);
@@ -501,7 +517,7 @@ const crawler = new CheerioCrawler({
         }
         return;
       } else {
-        // Detail page: merge card data with Wix embedded data
+        // Detail page: merge card data with Wix-embedded data
         const card = request.userData?.hkAga || {};
         const wix = extractWixData($, url);
         const desc = cleanDescription(wix.description);
