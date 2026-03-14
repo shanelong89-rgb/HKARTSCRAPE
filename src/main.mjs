@@ -1,8 +1,8 @@
-// CULTIVE HK Events Apify Actor v2.4
-// v2.4: HK-AGA card parsing + detail page Wix JSON mining for descriptions,
-//       addresses, and coordinates. Cards parsed from <a> text blobs.
+// CULTIVE HK Events Apify Actor v2.5
+// v2.5: Description extraction from DOM body text + Google Maps coords
+//       Address validation (must contain digits). 3-strategy desc fallback.
+// v2.4: HK-AGA detail page crawling with Wix JSON mining (desc=0, didn't work)
 // v2.3: Fixed HK-AGA card extraction (line splitting vs DOM traversal)
-// v2.2: Removed Time Out, focused on Eventbrite HK + HK-AGA
 // Deploy: push to GitHub -> Apify Console -> Rebuild -> Start
 
 import { CheerioCrawler, Dataset } from '@crawlee/cheerio';
@@ -281,59 +281,86 @@ function extractHkAgaCards($, url) {
   return cards;
 }
 
-// Mine Wix embedded JSON from detail pages for description, address, coords
+// Mine HK-AGA detail pages for description, address, coords
+// The Wix SPA DOES server-render body text, so we extract from DOM + body text
 function extractWixData($, url) {
-  const result = { description: '', address: '', lat: null, lng: null, phone: '', email: '', website: '' };
+  const result = { description: '', address: '', lat: null, lng: null };
+  const body = $('body').text() || '';
 
-  // Strategy 1: Look for Wix warmup data / initial data in script tags
-  const scriptTexts = [];
-  $('script').each((i, el) => {
-    const text = $(el).html() || '';
-    if (text.length > 100) scriptTexts.push(text);
+  // ── Address: find text after "Address:" label ──
+  // Use body text split by common field labels
+  const addrMatch = body.match(/Address[:\s]+([^\n]+)/i);
+  if (addrMatch) {
+    let addr = addrMatch[1].trim();
+    // Stop before Phone/Email/Website labels if on same line
+    addr = addr.split(/\s*(?:Phone|Email|Website|Tel)[:\s]/i)[0].trim();
+    // Avoid catching description text: valid addresses have numbers + road/street keywords
+    if (/\d/.test(addr) && (addr.length < 200)) {
+      result.address = addr;
+    }
+  }
+
+  // ── Description: collect substantial text paragraphs from DOM ──
+  // Strategy A: Find all text nodes > 80 chars that look like descriptions
+  const descParts = [];
+  $('p, div, span').each((i, el) => {
+    const text = $(el).clone().children().remove().end().text().trim();
+    if (text.length < 80) return;
+    // Skip if it looks like address, title, date, nav, or boilerplate
+    if (/^Address|^Phone|^Email|^Website|^Click here|FILTER|CURRENTLY|UPCOMING/i.test(text)) return;
+    if (/^\d{1,2}\s+\w{3,9}\s*[\-\u2013]/.test(text)) return; // date range
+    if (text === text.toUpperCase() && text.length < 50) return; // district label
+    descParts.push(text);
   });
 
-  for (const script of scriptTexts) {
-    // Look for exhibition description in embedded JSON
-    // Wix often stores page data in window.__INITIAL_DATA__ or similar
-    try {
-      // Try to find large text blocks that look like descriptions
-      const descMatches = script.match(/"(?:text|description|content|body|richText)"\s*:\s*"([^"]{50,})"/g);
-      if (descMatches) {
-        for (const m of descMatches) {
-          const val = m.match(/"(?:text|description|content|body|richText)"\s*:\s*"([^"]+)"/);
-          if (val && val[1].length > 50 && !val[1].includes('function') && !val[1].includes('window.')) {
-            let desc = val[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-            if (desc.length > result.description.length) result.description = desc.slice(0, 500);
-          }
-        }
-      }
-    } catch {}
-
-    // Look for address patterns
-    try {
-      const addrMatch = script.match(/"(?:address|formattedAddress|streetAddress)"\s*:\s*"([^"]{10,200})"/);
-      if (addrMatch && !result.address) result.address = addrMatch[1].replace(/\\n/g, ', ');
-    } catch {}
-
-    // Look for coordinates
-    try {
-      const latMatch = script.match(/"(?:lat|latitude)"\s*:\s*([0-9.]+)/);
-      const lngMatch = script.match(/"(?:lng|longitude)"\s*:\s*([0-9.]+)/);
-      if (latMatch && lngMatch) { result.lat = Number(latMatch[1]); result.lng = Number(lngMatch[1]); }
-    } catch {}
+  if (descParts.length > 0) {
+    // Take the longest paragraph(s), likely the exhibition description
+    descParts.sort((a, b) => b.length - a.length);
+    result.description = descParts[0].slice(0, 500);
   }
 
-  // Strategy 2: Try visible text for address (gallery info block is sometimes static)
-  if (!result.address) {
-    const body = $('body').text();
-    const addrMatch = body.match(/Address[:\s]*([^\n]{10,200})/i);
-    if (addrMatch) result.address = addrMatch[1].trim();
+  // Strategy B: If no long paragraphs found, try extracting text between
+  // the header section and "Click here" / "Address:" markers
+  if (!result.description) {
+    const clickIdx = body.indexOf('Click here');
+    const addrIdx = body.indexOf('Address');
+    const endIdx = clickIdx > 0 ? clickIdx : (addrIdx > 0 ? addrIdx : body.length);
+    // Skip the first ~100 chars (title, date, venue header)
+    const chunk = body.slice(Math.min(150, endIdx), endIdx).trim();
+    if (chunk.length > 80) {
+      result.description = chunk.replace(/\s+/g, ' ').slice(0, 500);
+    }
   }
 
-  // Strategy 3: Try meta tags for description
+  // Strategy C: og:description meta tag
   if (!result.description) {
     const ogDesc = ($('meta[property="og:description"]').attr('content') || '').trim();
-    if (ogDesc && ogDesc.length > 20 && !/hk-aga|exhibition/i.test(ogDesc)) result.description = ogDesc.slice(0, 500);
+    if (ogDesc && ogDesc.length > 30) result.description = ogDesc.slice(0, 500);
+  }
+
+  // ── Coordinates: from Google Maps iframe/embed URL ──
+  $('iframe[src*="maps"], iframe[src*="google"]').each((i, el) => {
+    const src = $(el).attr('src') || '';
+    // Pattern: q=LAT,LNG or @LAT,LNG or ll=LAT,LNG or center=LAT,LNG
+    const coordMatch = src.match(/(?:q=|@|ll=|center=)([0-9.]+)[,]([0-9.]+)/);
+    if (coordMatch && !result.lat) {
+      result.lat = Number(coordMatch[1]);
+      result.lng = Number(coordMatch[2]);
+    }
+  });
+
+  // Also try script tags for embedded coordinates
+  if (!result.lat) {
+    $('script').each((i, el) => {
+      const text = $(el).html() || '';
+      if (text.length < 50) return;
+      const latMatch = text.match(/"(?:lat|latitude)"\s*:\s*([0-9]{1,3}\.[0-9]+)/);
+      const lngMatch = text.match(/"(?:lng|longitude)"\s*:\s*([0-9]{1,3}\.[0-9]+)/);
+      if (latMatch && lngMatch && !result.lat) {
+        result.lat = Number(latMatch[1]);
+        result.lng = Number(lngMatch[1]);
+      }
+    });
   }
 
   return result;
