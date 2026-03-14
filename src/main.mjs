@@ -1,10 +1,10 @@
-// CULTIVE HK Events Apify Actor v2.6
+// CULTIVE HK Events Apify Actor v2.7
+// v2.7: Fix boilerplate-only descs (return ""), artist boilerplate leak,
+//       word-break spacing in descriptions, address-first district detection,
+//       improved artist extraction patterns
 // v2.6: Strip boilerplate from descriptions, date/endDate split, district
 //       normalization, default Free price, lowercase category, artist extraction
 // v2.5: Description extraction from DOM body text + Google Maps coords
-//       Address validation (must contain digits). 3-strategy desc fallback.
-// v2.4: HK-AGA detail page crawling with Wix JSON mining (desc=0, didn't work)
-// v2.3: Fixed HK-AGA card extraction (line splitting vs DOM traversal)
 // Deploy: push to GitHub -> Apify Console -> Rebuild -> Start
 
 import { CheerioCrawler, Dataset } from '@crawlee/cheerio';
@@ -87,41 +87,85 @@ const DISTRICT_MAP = {
   'WONG TAI SIN': 'Wong Tai Sin',
 };
 
+// v2.7: Address-first detection — real exhibition address beats card district label
 function normalizeDistrict(raw, address) {
-  const upper = (raw || '').trim().toUpperCase();
-  if (DISTRICT_MAP[upper]) return DISTRICT_MAP[upper];
+  // Priority 1: detect from actual address (most accurate for off-site exhibitions)
   const fromAddr = detectDistrict(address || '');
   if (fromAddr) return fromAddr;
+  // Priority 2: map HK-AGA uppercase district labels
+  const upper = (raw || '').trim().toUpperCase();
+  if (DISTRICT_MAP[upper]) return DISTRICT_MAP[upper];
+  // Priority 3: detect from raw district text
   const fromRaw = detectDistrict(raw || '');
   if (fromRaw) return fromRaw;
   return raw || '';
 }
 
-// Strip HK-AGA boilerplate footer text from descriptions
+// Boilerplate markers used in both cleanDescription and extractArtists
+const BOILERPLATE_MARKERS = [
+  'Founded in 2012, the Hong Kong Art Gallery Association',
+  'Founded in 2012',
+  '/* real people should not fill this in',
+  'TEMPUS FUGIT',
+];
+
+// v2.7: Strip HK-AGA boilerplate — idx >= 0 catches boilerplate-only descriptions
 function cleanDescription(desc) {
   if (!desc) return '';
-  const markers = [
-    'Founded in 2012, the Hong Kong Art Gallery Association',
-    '/* real people should not fill this in',
-    'TEMPUS FUGIT',
-  ];
   let clean = desc;
-  for (const marker of markers) {
+  for (const marker of BOILERPLATE_MARKERS) {
     const idx = clean.indexOf(marker);
-    if (idx > 0) clean = clean.slice(0, idx);
+    if (idx >= 0) clean = clean.slice(0, idx);
   }
-  return clean.replace(/\s+/g, ' ').trim();
+  clean = clean.replace(/\s+/g, ' ').trim();
+  // If after stripping we have less than 20 chars, it's basically empty
+  return clean.length >= 20 ? clean : '';
 }
 
-// Extract artist names from description text
+// v2.7: Extract artist names — strip boilerplate first, multiple patterns
 function extractArtists(desc) {
+  if (!desc) return [];
+  // Strip boilerplate before parsing to prevent contamination
+  let clean = desc;
+  for (const marker of BOILERPLATE_MARKERS) {
+    const idx = clean.indexOf(marker);
+    if (idx >= 0) clean = clean.slice(0, idx);
+  }
+  clean = clean.trim();
+  if (!clean) return [];
+
   const artists = [];
-  const presented = desc.match(/[Aa]rtists?\s*(?:presented|featured|include)?\s*:\s*([^.]+)/);
+
+  // Pattern 1: "Artists presented:" or "Artists:" or "Artists include:"
+  const presented = clean.match(/[Aa]rtists?\s*(?:presented|featured|include|exhibiting)?\s*:\s*([^.\n]+)/);
   if (presented) {
     const names = presented[1].split(/,|\band\b/).map(n => n.trim()).filter(n => n.length > 2 && n.length < 60);
     artists.push(...names);
   }
-  return artists;
+
+  // Pattern 2: "solo exhibition of [Name]" or "[Name]'s solo show/exhibition"
+  if (artists.length === 0) {
+    const solo1 = clean.match(/solo\s+(?:exhibition|show)\s+(?:of|by)\s+([A-Z][\w\s,.-]+?)(?:[,.]|\s+(?:featuring|curated|at|in|from))/i);
+    if (solo1) artists.push(solo1[1].trim());
+    const solo2 = clean.match(/present(?:s|ed)?\s+(?:the\s+)?solo\s+(?:exhibition|show)\s+of\s+([A-Z][\w\s,.-]+?)(?:[,.]|\s*[\u201c"])/i);
+    if (solo2 && artists.length === 0) artists.push(solo2[1].trim());
+  }
+
+  // Pattern 3: "presents [Name]'s" or "present [Name],"
+  if (artists.length === 0) {
+    const presents = clean.match(/present(?:s|ed)?\s+(?:a\s+)?(?:two-person\s+exhibition\s+bringing\s+together\s+)?([A-Z][A-Za-z\s.-]+?)(?:'s|,\s*(?:a|an|the|featuring|curated))/);
+    if (presents) artists.push(presents[1].trim());
+  }
+
+  // Filter: remove any names that still contain boilerplate fragments or are too generic
+  const filtered = artists.filter(a =>
+    a.length > 2 && a.length < 60 &&
+    !a.includes('Founded') && !a.includes('Hong Kong Art Gallery') &&
+    !a.includes('real people') && !a.includes('TEMPUS') &&
+    !/^(the|a|an|this|that|our|their)\s/i.test(a)
+  );
+
+  return filtered;
 }
 
 const HK_DISTRICTS = [
@@ -132,6 +176,7 @@ const HK_DISTRICTS = [
   'Stanley','Kennedy Town','Sai Ying Pun','North Point',
   'Quarry Bay','Tai Koo','Chai Wan','West Kowloon',
   'Wong Chuk Hang','Hung Hom','Diamond Hill','Tai Kwun','PMQ',
+  'Tin Wan','Ap Lei Chau','Repulse Bay','Happy Valley',
 ];
 
 function detectDistrict(text) {
@@ -247,7 +292,6 @@ function extractEventbriteDetail($, url) {
   const title = $('h1').first().text().trim() || $('meta[property="og:title"]').attr('content') || '';
   if (!title || title.length < 5) return [];
 
-  // Date: prefer time[datetime], fallback to text pattern
   let date = $('time').first().attr('datetime') || '';
   if (!date) {
     const bodyText = $('body').text();
@@ -255,7 +299,6 @@ function extractEventbriteDetail($, url) {
     if (dateP) date = dateP[1];
   }
 
-  // Venue: extract first text node only, strip trailing region/date
   let venueName = '';
   const venueEl = $('[class*="location-info"]').first();
   if (venueEl.length) {
@@ -265,7 +308,6 @@ function extractEventbriteDetail($, url) {
     venueName = venueName.replace(/,?\s*(?:HKI|KOW|NT|NTW)\s*$/, '').trim();
   }
 
-  // Address: try second <p> inside location-info, clean same way
   let address = '';
   if (venueEl.length) {
     const pEls = venueEl.find('p');
@@ -275,7 +317,6 @@ function extractEventbriteDetail($, url) {
     if (venueName && address.startsWith(venueName)) address = address.slice(venueName.length).trim();
   }
 
-  // Price
   let price = '';
   $('[class*="conversion-bar"] [class*="price"], [class*="ticket"] [class*="price"]').each((i, el) => {
     const t = $(el).text().trim();
@@ -337,6 +378,16 @@ function extractHkAgaCards($, url) {
   return cards;
 }
 
+// v2.7: Inject spaces for <br> and block tags before text extraction
+function spacedText($, el) {
+  const html = $(el).html() || '';
+  // Replace <br>, </p>, </div>, </li>, </h1-6> with space before extracting text
+  const spaced = html.replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<\/(p|div|li|h[1-6]|span|td|th|blockquote)>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ');
+  return spaced.replace(/\s+/g, ' ').trim();
+}
+
 // Mine HK-AGA detail pages for description, address, coords
 function extractWixData($, url) {
   const result = { description: '', address: '', lat: null, lng: null };
@@ -352,10 +403,10 @@ function extractWixData($, url) {
     }
   }
 
-  // ── Description: Strategy A ──
+  // ── Description: Strategy A ── v2.7: use spacedText for proper word breaks
   const descParts = [];
   $('p, div, span').each((i, el) => {
-    const text = $(el).clone().children().remove().end().text().trim();
+    const text = spacedText($, $(el).clone().children().remove().end());
     if (text.length < 80) return;
     if (/^Address|^Phone|^Email|^Website|^Click here|FILTER|CURRENTLY|UPCOMING/i.test(text)) return;
     if (/^\d{1,2}\s+\w{3,9}\s*[\-\u2013]/.test(text)) return;
@@ -369,7 +420,7 @@ function extractWixData($, url) {
     result.description = unique.join(' ').replace(/\s+/g, ' ').trim();
   }
 
-  // Strategy B
+  // Strategy B: fallback to body text between header and "Click here"/"Address:"
   if (!result.description) {
     const clickIdx = body.indexOf('Click here');
     const addrIdx = body.indexOf('Address');
@@ -380,13 +431,13 @@ function extractWixData($, url) {
     }
   }
 
-  // Strategy C: og:description
+  // Strategy C: og:description meta tag
   if (!result.description) {
     const ogDesc = ($('meta[property="og:description"]').attr('content') || '').trim();
     if (ogDesc && ogDesc.length > 30) result.description = ogDesc;
   }
 
-  // ── Coordinates ──
+  // ── Coordinates: from Google Maps iframe/embed URL ──
   $('iframe[src*="maps"], iframe[src*="google"]').each((i, el) => {
     const src = $(el).attr('src') || '';
     const coordMatch = src.match(/(?:q=|@|ll=|center=)([0-9.]+)[,]([0-9.]+)/);
@@ -456,7 +507,7 @@ const crawler = new CheerioCrawler({
         const desc = cleanDescription(wix.description);
         const artists = extractArtists(wix.description);
         const district = normalizeDistrict(card.district || '', wix.address || '');
-        log.info('HK-AGA detail: desc=' + desc.length + ' chars, addr=' + (wix.address || 'none'));
+        log.info('HK-AGA detail: desc=' + desc.length + ' chars, artists=' + artists.length + ', addr=' + (wix.address || 'none'));
 
         events = [mapToCultiveSchema({
           title: card.title || '', date: card.date || '',
