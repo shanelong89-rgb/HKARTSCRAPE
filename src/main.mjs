@@ -1,6 +1,7 @@
 // CULTIVE HK Events Apify Actor v2.3
-// v2.3: Fixed HK-AGA detail extraction (og:title, Wix selectors, junk filter)
-//       Fixed Eventbrite venue/address concatenation
+// v2.3: HK-AGA is a Wix SPA — extract titles from listing cards,
+//       pass via userData to detail pages for gallery info merge.
+//       Fixed Eventbrite venue/address concatenation.
 // v2.2: Removed Time Out, focused on Eventbrite HK + HK-AGA
 // Deploy: push to GitHub -> Apify Console -> Rebuild -> Start
 
@@ -22,7 +23,7 @@ const {
 const proxyConfig = await Actor.createProxyConfiguration({ checkAccess: true });
 const seen = new Set();
 
-// ── Helpers ──────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────���────────
 
 function tryText($el, sels) {
   for (const s of sels) {
@@ -232,119 +233,161 @@ function isHkAgaListing(url) {
   return /\/exhibitions\/?($|\?)/.test(new URL(url).pathname + new URL(url).search);
 }
 
-function extractHkAgaLinks($, url) {
-  const links = new Set();
+// Extract exhibition links WITH their surrounding card context from listing page
+function extractHkAgaLinksWithContext($, url) {
+  const results = [];
+  const seen = new Set();
   $('a[href]').each((i, el) => {
     const href = $(el).attr('href');
     if (!href) return;
     const full = resolveUrl(href, url);
-    if (/hk-aga\.org\/exhibitions\/\d+/.test(full)) {
-      links.add(full);
-    }
-  });
-  return [...links];
-}
+    if (!/hk-aga\.org\/exhibitions\/\d+/.test(full)) return;
+    if (seen.has(full)) return;
+    seen.add(full);
 
-function extractHkAgaCards($, url) {
-  const events = [];
-  const selectors = ['[class*="exhibition"]','article','.card','.item','.grid-item','.col'];
-  for (const sel of selectors) {
-    const cards = $(sel);
-    if (cards.length < 2) continue;
-    cards.each((i, el) => {
-      const $c = $(el), text = $c.text();
-      let title = '';
-      $c.find('h2,h3,h4,strong,[class*="title"]').each((j, h) => {
+    // The link text itself might be the exhibition title
+    let title = $(el).text().trim();
+
+    // Walk up to find parent card container for more context
+    let $card = $(el).closest('[class*="exhibition"], article, .card, .item, .col, div').first();
+    if (!$card.length) $card = $(el).parent().parent();
+    const cardText = $card.length ? $card.text().trim() : '';
+
+    // If link text is too short, try the card headings
+    if (!title || title.length < 3) {
+      $card.find('h2,h3,h4,strong,[class*="title"]').each((j, h) => {
         const t = $(h).text().trim();
-        if (t && t.length > 2 && t !== t.toUpperCase() && !title) title = t;
+        if (t && t.length >= 3 && t.length < 150 && !title) title = t;
       });
-      if (!title) title = $c.find('h2,h3,h4').first().text().trim();
-      if (!title || title.length < 3) return;
-      let district = '';
-      $c.find('span,div,p').each((j, e2) => {
-        const t = $(e2).text().trim();
-        if (t && t.length > 2 && t.length < 40 && t === t.toUpperCase() && !district) district = t;
-      });
-      const dateMatch = text.match(/(\d{1,2}\s+\w{3,9}\s*[-]\s*\d{1,2}\s+\w{3,9},?\s*\d{4})/);
-      const image = $c.find('img').first().attr('src') || '';
-      const link = $c.find('a').first().attr('href') || '';
-      events.push(mapToCultiveSchema({
-        title, date: dateMatch ? dateMatch[1] : '', image,
-        district: detectDistrict(district) || district,
-        category: 'Art', modes: ['Indoor'],
-        sourceUrl: link ? resolveUrl(link, url) : url,
-      }, url));
+    }
+
+    // Extract date from card context
+    const dateMatch = cardText.match(/(\d{1,2}\s+\w{3,9}\s*[-\u2013]\s*\d{1,2}\s+\w{3,9},?\s*\d{4})/)
+      || cardText.match(/(\d{1,2}\s+\w{3,9}\s*[-\u2013]\s*\d{1,2}\s+\w{3,9},?\s*\d{4})/);
+
+    // Extract venue from card context (often a line below the date)
+    let venue = '';
+    $card.find('span,div,p,small').each((j, e2) => {
+      const t = $(e2).text().trim();
+      // Look for gallery names — typically mixed case, not too long, not a date
+      if (t && t.length > 3 && t.length < 60 && !venue
+        && !/\d{1,2}\s+\w{3,9}/.test(t) && t !== title
+        && !/^(CURRENTLY|UPCOMING|PAST|FILTER)/.test(t)) {
+        venue = t;
+      }
     });
-    if (events.length > 0) break;
-  }
-  return events;
+
+    // Extract district from uppercase text in card
+    let district = '';
+    $card.find('span,div,p,small').each((j, e2) => {
+      const t = $(e2).text().trim();
+      if (t && t.length > 2 && t.length < 40 && t === t.toUpperCase()
+        && !/^(CURRENTLY|UPCOMING|PAST|FILTER|EXHIBITION)/.test(t) && !district) {
+        district = t;
+      }
+    });
+
+    // Extract image from card
+    const image = $card.find('img').first().attr('src') || '';
+
+    results.push({
+      url: full, title: title || '',
+      date: dateMatch ? dateMatch[1] : '',
+      venue, district, image: image ? resolveUrl(image, url) : '',
+    });
+  });
+  return results;
 }
 
-function extractHkAgaDetail($, url) {
-  // HK-AGA uses Wix — titles may be in og:title, h1, h2, h3, or Wix elements
-  const JUNK = ['join','mailing list','subscribe','newsletter','login','sign up','contact','cookie'];
-  function isJunk(t) { const l = t.toLowerCase(); return JUNK.some(j => l.includes(j)) || t.length > 200; }
+function extractHkAgaDetail($, url, userData) {
+  // HK-AGA is a Wix SPA — exhibition content is JS-rendered.
+  // The static HTML only contains the gallery info block.
+  // We rely on userData.hkAgaTitle from the listing page.
 
-  // Try og:title first (most reliable on Wix sites), strip site suffix
-  let title = ($('meta[property="og:title"]').attr('content') || '').replace(/\s*[|\-]\s*HK-?AGA.*/i, '').trim();
-  // Fallback to heading elements and Wix-specific selectors
-  if (!title || title.length < 3 || isJunk(title)) {
-    const headings = ['h1','h2','h3','[data-testid="richTextElement"]','.font_2','.font_3','[class*="title"]'];
-    for (const sel of headings) {
-      $(sel).each((i, el) => {
-        if (title && !isJunk(title)) return;
-        const t = $(el).text().trim();
-        if (t && t.length >= 3 && t.length < 200 && !isJunk(t)) title = t;
-      });
-      if (title && !isJunk(title)) break;
-    }
+  const JUNK = ['join','mailing list','subscribe','newsletter','login','sign up','contact','cookie','exhibitions'];
+  function isJunk(t) { const l = t.toLowerCase(); return JUNK.some(j => l === j || l.startsWith(j + ' ')) || t.length > 200; }
+
+  // Title: prefer userData from listing page, then try static HTML sources
+  let title = (userData && userData.hkAgaTitle) || '';
+  if (!title || isJunk(title)) {
+    // Try og:title but strip generic suffixes
+    title = ($('meta[property="og:title"]').attr('content') || '').replace(/\s*[|\-]\s*HK-?AGA.*/i, '').trim();
+  }
+  if (!title || isJunk(title)) {
+    // Try heading elements
+    $('h1,h2,h3').each((i, el) => {
+      if (title && !isJunk(title)) return;
+      const t = $(el).text().trim();
+      if (t && t.length >= 3 && t.length < 200 && !isJunk(t)) title = t;
+    });
   }
   if (!title || title.length < 3 || isJunk(title)) return [];
 
   const body = $('body').text();
-  // Date patterns: "1 Mar - 15 Apr, 2026" or "until 30 April 2026" or "March 15, 2026"
-  const dateMatch = body.match(/(\d{1,2}\s+\w{3,9}\s*[-\u2013]\s*\d{1,2}\s+\w{3,9},?\s*\d{4})/)
-    || body.match(/until\s+(\d{1,2}\s+\w{3,9},?\s*\d{4})/i)
-    || body.match(/(\w{3,9}\s+\d{1,2},?\s*\d{4})/);
 
-  // Description: try multiple container selectors (Wix uses divs, not article/main)
-  let desc = '';
-  const descSels = ['article p','main p','.content p','[data-testid="richTextElement"] p','div[class*="text"] p','section p','p'];
-  for (const sel of descSels) {
-    $(sel).each((i, el) => {
-      if (desc.length >= 500) return;
-      const t = $(el).text().trim();
-      if (t.length > 30 && !isJunk(t) && t !== title) desc += (desc ? ' ' : '') + t;
-    });
-    if (desc.length > 50) break;
+  // Date from userData or static HTML
+  let date = (userData && userData.hkAgaDate) || '';
+  if (!date) {
+    const dateMatch = body.match(/(\d{1,2}\s+\w{3,9}\s*[-\u2013]\s*\d{1,2}\s+\w{3,9},?\s*\d{4})/)
+      || body.match(/until\s+(\d{1,2}\s+\w{3,9},?\s*\d{4})/i);
+    if (dateMatch) date = dateMatch[1];
   }
-  if (!desc) desc = $('meta[property="og:description"]').attr('content') || '';
 
-  // Image: og:image first, then content images (skip logos/icons)
-  let image = $('meta[property="og:image"]').attr('content') || '';
+  // Gallery/venue name — look for it in the static info block
+  let venueName = (userData && userData.hkAgaVenue) || '';
+  if (!venueName) {
+    // HK-AGA detail pages have a gallery section with the name
+    $('h2,h3,h4,strong').each((i, el) => {
+      const t = $(el).text().trim();
+      if (t && t.length > 2 && t.length < 60 && t !== title && !venueName
+        && !/exhibitions|filter|currently|upcoming/i.test(t)) {
+        venueName = t;
+      }
+    });
+  }
+
+  // Address from static gallery info block
+  const addrMatch = body.match(/Address:\s*([^\n]*?)(?=Phone:|Email:|Website:|$)/i);
+  let address = addrMatch ? addrMatch[1].trim().slice(0, 120) : '';
+
+  // Description — try og:description, then any paragraph text
+  let desc = $('meta[property="og:description"]').attr('content') || '';
+  if (!desc || desc.length < 20) {
+    $('p').each((i, el) => {
+      if (desc.length >= 400) return;
+      const t = $(el).text().trim();
+      if (t.length > 40 && !/Address:|Phone:|Email:|Website:/i.test(t) && t !== title) {
+        desc += (desc ? ' ' : '') + t;
+      }
+    });
+  }
+
+  // Image from userData or og:image (skip btns.svg and other UI assets)
+  let image = (userData && userData.hkAgaImage) || '';
   if (!image) {
-    $('article img, main img, section img, [class*="gallery"] img, img[src*="wix"], img').each((i, el) => {
+    const ogImg = $('meta[property="og:image"]').attr('content') || '';
+    if (ogImg && !ogImg.includes('btns.svg') && !ogImg.includes('logo') && !ogImg.includes('icon')) {
+      image = ogImg;
+    }
+  }
+  if (!image) {
+    $('img').each((i, el) => {
       if (image) return;
       const src = $(el).attr('src') || '';
-      if (src && !src.includes('logo') && !src.includes('icon') && !src.includes('avatar')) image = src;
+      if (src && !src.includes('btns.svg') && !src.includes('logo') && !src.includes('icon')
+        && !src.includes('avatar') && !src.includes('sprite')) {
+        image = resolveUrl(src, url);
+      }
     });
   }
 
-  // Address and venue
-  const addrMatch = body.match(/(?:Address|Location)\s*:?\s*([^\n]{10,80})/i);
-  let venue = '';
-  $('[class*="gallery"],[class*="venue"],[class*="location"]').each((i, el) => {
-    if (!venue) { const t = $(el).text().trim(); if (t.length > 2 && t.length < 60) venue = t; }
-  });
+  const district = (userData && userData.hkAgaDistrict) || detectDistrict(address + ' ' + venueName);
 
   return [mapToCultiveSchema({
-    title,
-    date: $('time').first().attr('datetime') || (dateMatch ? dateMatch[1] : ''),
-    venueName: venue,
+    title, date, venueName,
     description: desc.slice(0, 500),
-    image,
-    address: addrMatch ? addrMatch[1].trim() : '',
-    category: 'Art', modes: ['Indoor'], sourceUrl: url,
+    image, address,
+    district, category: 'Art', modes: ['Indoor'], sourceUrl: url,
   }, url)];
 }
 
@@ -374,17 +417,43 @@ const crawler = new CheerioCrawler({
       }
     } else if (isHkAga(url)) {
       if (isHkAgaListing(url)) {
-        const links = extractHkAgaLinks($, url);
-        if (links.length > 0) {
-          await crawler.addRequests(links.map(u => ({ url: u })));
-          log.info('Enqueued ' + links.length + ' HK-AGA detail pages');
+        // Extract links with card context from listing page
+        const linksWithContext = extractHkAgaLinksWithContext($, url);
+        log.info('Found ' + linksWithContext.length + ' HK-AGA exhibition links');
+
+        if (linksWithContext.length > 0) {
+          // Enqueue detail pages with card context as userData
+          await crawler.addRequests(linksWithContext.map(ctx => ({
+            url: ctx.url,
+            userData: {
+              hkAgaTitle: ctx.title,
+              hkAgaDate: ctx.date,
+              hkAgaVenue: ctx.venue,
+              hkAgaDistrict: ctx.district,
+              hkAgaImage: ctx.image,
+            },
+          })));
+          log.info('Enqueued ' + linksWithContext.length + ' HK-AGA detail pages with context');
+
+          // Also save card-only events for any cards that have enough data
+          for (const ctx of linksWithContext) {
+            if (ctx.title && ctx.title.length >= 3) {
+              events.push(mapToCultiveSchema({
+                title: ctx.title, date: ctx.date,
+                venueName: ctx.venue, district: ctx.district,
+                image: ctx.image, category: 'Art', modes: ['Indoor'],
+                sourceUrl: ctx.url,
+              }, url));
+            }
+          }
+          if (events.length > 0) {
+            log.info('Extracted ' + events.length + ' events from listing cards');
+          }
         }
-        const cards = extractHkAgaCards($, url);
-        if (cards.length > 0) events.push(...cards);
       } else if (/\/exhibitions\/\d+/.test(url)) {
-        events = extractHkAgaDetail($, url);
+        // Detail page — merge userData from listing with static HTML data
+        events = extractHkAgaDetail($, url, request.userData || {});
       }
-      // else: skip non-exhibition HK-AGA pages
     } else {
       events = extractJsonLdEvents($, url);
     }
