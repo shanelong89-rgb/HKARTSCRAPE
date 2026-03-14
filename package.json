@@ -1,6 +1,6 @@
 {
   "name": "cultive-hk-event-scraper",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "type": "module",
   "description": "Apify Actor to scrape HK events for CULTIVE platform",
   "engines": { "node": ">=18.0.0" },
