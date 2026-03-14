@@ -23,7 +23,7 @@ const {
 const proxyConfig = await Actor.createProxyConfiguration({ checkAccess: true });
 const seen = new Set();
 
-// ── Helpers ────────────────────��────────────────────────────
+// ── Helpers ─────────────────────���──────────────────────────
 
 function tryText($el, sels) {
   for (const s of sels) {
@@ -103,7 +103,7 @@ function mapToCultiveSchema(raw, url) {
   const time = r.time || r.startTime || '';
   const venueName = r.venueName || r.venue || r.locationName || r.place ||
     (r.location && typeof r.location === 'object' ? r.location.name : '') || '';
-  const description = (r.description || r.text || r.content || r.summary || '').slice(0, 250);
+  const description = (r.description || r.text || r.content || r.summary || '');
   const imgRaw = r.image || r.imageUrl || r.photo || r.thumbnail || r.flyerFront || '';
   const image = typeof imgRaw === 'object' ? (imgRaw.url || imgRaw.src || '') : imgRaw;
   const price = r.price || r.cost || r.ticketPrice ||
@@ -314,9 +314,11 @@ function extractWixData($, url) {
   });
 
   if (descParts.length > 0) {
-    // Take the longest paragraph(s), likely the exhibition description
+    // Concatenate all description paragraphs, deduplicate overlaps
     descParts.sort((a, b) => b.length - a.length);
-    result.description = descParts[0].slice(0, 250);
+    // Filter out parts that are substrings of longer parts
+    const unique = descParts.filter((p, i) => !descParts.slice(0, i).some(longer => longer.includes(p)));
+    result.description = unique.join(' ').replace(/\\s+/g, ' ').trim();
   }
 
   // Strategy B: If no long paragraphs found, try extracting text between
@@ -328,14 +330,14 @@ function extractWixData($, url) {
     // Skip the first ~100 chars (title, date, venue header)
     const chunk = body.slice(Math.min(150, endIdx), endIdx).trim();
     if (chunk.length > 80) {
-      result.description = chunk.replace(/\s+/g, ' ').slice(0, 250);
+      result.description = chunk.replace(/\\s+/g, ' ').trim();
     }
   }
 
   // Strategy C: og:description meta tag
   if (!result.description) {
     const ogDesc = ($('meta[property="og:description"]').attr('content') || '').trim();
-    if (ogDesc && ogDesc.length > 30) result.description = ogDesc.slice(0, 250);
+    if (ogDesc && ogDesc.length > 30) result.description = ogDesc;
   }
 
   // ── Coordinates: from Google Maps iframe/embed URL ──
