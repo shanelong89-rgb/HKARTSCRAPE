@@ -1,0 +1,6 @@
+node_modules/
+storage/
+apify_storage/
+.venv/
+.idea/
+.DS_Store

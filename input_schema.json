@@ -1,0 +1,32 @@
+{
+    "title": "CULTIVE HK Event Scraper",
+    "description": "Scrapes Hong Kong event listings and outputs data in CULTIVE import format.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "startUrls": {
+            "title": "Start URLs",
+            "type": "array",
+            "description": "List of event listing page URLs to scrape.",
+            "editor": "stringList",
+            "default": [
+                "https://www.lifestyleasia.com/hk/whats-on/events-whats-on/",
+                "https://www.timeout.com/hong-kong/things-to-do/things-to-do-in-hong-kong-this-weekend"
+            ]
+        },
+        "maxRequestsPerCrawl": {
+            "title": "Max Requests",
+            "type": "integer",
+            "description": "Maximum number of pages to crawl per run.",
+            "default": 100,
+            "minimum": 1
+        },
+        "followLinks": {
+            "title": "Follow Links",
+            "type": "boolean",
+            "description": "Whether to follow links to individual event pages for more detail.",
+            "default": true
+        }
+    },
+    "required": ["startUrls"]
+}
