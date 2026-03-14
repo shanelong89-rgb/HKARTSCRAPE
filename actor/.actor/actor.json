@@ -1,0 +1,9 @@
+{
+  "actorSpecification": 1,
+  "name": "cultive-hk-event-scraper",
+  "title": "CULTIVE HK Event Scraper",
+  "description": "Scrapes Hong Kong event listings for the CULTIVE platform.",
+  "version": "2.2.0",
+  "input": "../input_schema.json",
+  "dockerfile": "../Dockerfile"
+}
