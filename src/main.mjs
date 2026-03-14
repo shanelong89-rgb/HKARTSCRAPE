@@ -1,7 +1,7 @@
-// CULTIVE HK Events Apify Actor v2.3
-// v2.3: HK-AGA is a Wix SPA — card text contains structured data
-//       (district, title, date, venue, type) parsed from <a> text blobs.
-//       Detail pages skipped (JS-rendered). Eventbrite venue fix.
+// CULTIVE HK Events Apify Actor v2.4
+// v2.4: HK-AGA card parsing + detail page Wix JSON mining for descriptions,
+//       addresses, and coordinates. Cards parsed from <a> text blobs.
+// v2.3: Fixed HK-AGA card extraction (line splitting vs DOM traversal)
 // v2.2: Removed Time Out, focused on Eventbrite HK + HK-AGA
 // Deploy: push to GitHub -> Apify Console -> Rebuild -> Start
 
@@ -17,7 +17,7 @@ const {
     'https://www.eventbrite.hk/d/hong-kong/arts--events/',
     'https://www.hk-aga.org/exhibitions',
   ],
-  maxRequestsPerCrawl = 80,
+  maxRequestsPerCrawl = 120,
 } = (await Actor.getInput()) ?? {};
 
 const proxyConfig = await Actor.createProxyConfiguration({ checkAccess: true });
@@ -241,7 +241,7 @@ function isHkAgaListing(url) {
 //   Line 5: Type label (e.g. "Art Galleries" / "Art Spaces")
 // Parse this blob directly instead of traversing DOM containers.
 function extractHkAgaCards($, url) {
-  const events = [];
+  const cards = [];
   const seen = new Set();
   $('a[href]').each((i, el) => {
     const href = $(el).attr('href');
@@ -260,49 +260,83 @@ function extractHkAgaCards($, url) {
     let district = '', title = '', date = '', venue = '', typeLabel = '';
 
     for (const line of lines) {
-      // District: all uppercase, typically first line
       if (!district && line === line.toUpperCase() && line.length >= 3 && line.length < 40
         && !/^(ART |CURRENTLY|UPCOMING|PAST|FILTER)/.test(line)
         && !/\d{1,2}\s+\w{3,9}/.test(line)) {
-        district = line;
-        continue;
+        district = line; continue;
       }
-      // Type label: "Art Galleries" or "Art Spaces"
-      if (/^Art\s+(Galleries|Spaces|Gallery)$/i.test(line)) {
-        typeLabel = line;
-        continue;
-      }
-      // Date range: digits + month + dash + digits + month + year
+      if (/^Art\s+(Galleries|Spaces|Gallery)$/i.test(line)) { typeLabel = line; continue; }
       if (!date && /\d{1,2}\s+\w{3,9}\s*[\-\u2013]\s*\d{1,2}\s+\w{3,9},?\s*\d{4}/.test(line)) {
-        date = line;
-        continue;
+        date = line; continue;
       }
-      // Title: first non-district, non-date, non-type text line
-      if (!title && line.length >= 3) {
-        title = line;
-        continue;
-      }
-      // Venue: next text line after title
-      if (title && !venue && line.length >= 2) {
-        venue = line;
-        continue;
-      }
+      if (!title && line.length >= 3) { title = line; continue; }
+      if (title && !venue && line.length >= 2) { venue = line; continue; }
     }
 
     if (!title || title.length < 3) return;
-
-    // Image: from img tag inside this specific <a> element
     const image = $(el).find('img').first().attr('src') || '';
 
-    events.push(mapToCultiveSchema({
-      title, date, venueName: venue,
-      district: detectDistrict(district + ' ' + venue) || district,
-      image: image ? resolveUrl(image, url) : '',
-      category: 'Art', modes: ['Indoor'],
-      sourceUrl: full,
-    }, url));
+    cards.push({ url: full, title, date, venue, district, image: image ? resolveUrl(image, url) : '' });
   });
-  return events;
+  return cards;
+}
+
+// Mine Wix embedded JSON from detail pages for description, address, coords
+function extractWixData($, url) {
+  const result = { description: '', address: '', lat: null, lng: null, phone: '', email: '', website: '' };
+
+  // Strategy 1: Look for Wix warmup data / initial data in script tags
+  const scriptTexts = [];
+  $('script').each((i, el) => {
+    const text = $(el).html() || '';
+    if (text.length > 100) scriptTexts.push(text);
+  });
+
+  for (const script of scriptTexts) {
+    // Look for exhibition description in embedded JSON
+    // Wix often stores page data in window.__INITIAL_DATA__ or similar
+    try {
+      // Try to find large text blocks that look like descriptions
+      const descMatches = script.match(/"(?:text|description|content|body|richText)"\s*:\s*"([^"]{50,})"/g);
+      if (descMatches) {
+        for (const m of descMatches) {
+          const val = m.match(/"(?:text|description|content|body|richText)"\s*:\s*"([^"]+)"/);
+          if (val && val[1].length > 50 && !val[1].includes('function') && !val[1].includes('window.')) {
+            let desc = val[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+            if (desc.length > result.description.length) result.description = desc.slice(0, 500);
+          }
+        }
+      }
+    } catch {}
+
+    // Look for address patterns
+    try {
+      const addrMatch = script.match(/"(?:address|formattedAddress|streetAddress)"\s*:\s*"([^"]{10,200})"/);
+      if (addrMatch && !result.address) result.address = addrMatch[1].replace(/\\n/g, ', ');
+    } catch {}
+
+    // Look for coordinates
+    try {
+      const latMatch = script.match(/"(?:lat|latitude)"\s*:\s*([0-9.]+)/);
+      const lngMatch = script.match(/"(?:lng|longitude)"\s*:\s*([0-9.]+)/);
+      if (latMatch && lngMatch) { result.lat = Number(latMatch[1]); result.lng = Number(lngMatch[1]); }
+    } catch {}
+  }
+
+  // Strategy 2: Try visible text for address (gallery info block is sometimes static)
+  if (!result.address) {
+    const body = $('body').text();
+    const addrMatch = body.match(/Address[:\s]*([^\n]{10,200})/i);
+    if (addrMatch) result.address = addrMatch[1].trim();
+  }
+
+  // Strategy 3: Try meta tags for description
+  if (!result.description) {
+    const ogDesc = ($('meta[property="og:description"]').attr('content') || '').trim();
+    if (ogDesc && ogDesc.length > 20 && !/hk-aga|exhibition/i.test(ogDesc)) result.description = ogDesc.slice(0, 500);
+  }
+
+  return result;
 }
 
 // ── Crawler ──────────────────────────────────────────────────
@@ -331,11 +365,36 @@ const crawler = new CheerioCrawler({
       }
     } else if (isHkAga(url)) {
       if (isHkAgaListing(url)) {
-        // Extract all events from listing page cards (detail pages are JS-rendered, useless with Cheerio)
-        events = extractHkAgaCards($, url);
-        log.info('Extracted ' + events.length + ' HK-AGA exhibitions from listing cards');
+        // Extract card data and enqueue detail pages for descriptions
+        const cards = extractHkAgaCards($, url);
+        log.info('Found ' + cards.length + ' HK-AGA exhibition cards');
+
+        if (cards.length > 0) {
+          // Enqueue detail pages with card context
+          await crawler.addRequests(cards.map(c => ({
+            url: c.url,
+            userData: { hkAga: c },
+          })));
+          log.info('Enqueued ' + cards.length + ' HK-AGA detail pages for descriptions');
+        }
+        return; // Don't save yet — wait for detail pages
+      } else {
+        // Detail page: merge card data with Wix embedded data
+        const card = request.userData?.hkAga || {};
+        const wix = extractWixData($, url);
+        log.info('HK-AGA detail: desc=' + wix.description.length + ' chars, addr=' + (wix.address || 'none'));
+
+        events = [mapToCultiveSchema({
+          title: card.title || '', date: card.date || '',
+          venueName: card.venue || '',
+          district: detectDistrict((card.district || '') + ' ' + (card.venue || '')) || card.district || '',
+          image: card.image || '',
+          description: wix.description, address: wix.address,
+          lat: wix.lat, lng: wix.lng,
+          category: 'Art', modes: ['Indoor'],
+          sourceUrl: url,
+        }, url)];
       }
-      // Skip detail pages — HK-AGA is a Wix SPA, content is JS-rendered
     } else {
       events = extractJsonLdEvents($, url);
     }
