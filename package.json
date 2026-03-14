@@ -1,17 +1,15 @@
 {
-    "name": "cultive-hk-event-scraper",
-    "version": "1.0.0",
-    "type": "module",
-    "description": "Apify Actor — scrapes HK event listings for the CULTIVE platform",
-    "engines": {
-        "node": ">=18.0.0"
-    },
-    "dependencies": {
-        "@crawlee/cheerio": "^3.11.0",
-        "apify": "^3.2.0"
-    },
-    "scripts": {
-        "start": "node src/main.mjs",
-        "test": "echo \"No tests yet\""
-    }
+  "name": "cultive-hk-event-scraper",
+  "version": "2.2.0",
+  "type": "module",
+  "description": "Apify Actor to scrape HK events for CULTIVE platform",
+  "engines": { "node": ">=18.0.0" },
+  "dependencies": {
+    "@crawlee/cheerio": "^3.11.0",
+    "apify": "^3.2.0"
+  },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "echo \"No tests yet\""
+  }
 }
