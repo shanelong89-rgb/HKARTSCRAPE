@@ -211,11 +211,8 @@ function extractHkAgaLinks($, url) {
     const href = $(el).attr('href');
     if (!href) return;
     const full = resolveUrl(href, url);
-    if (full.includes('hk-aga.org') && full !== url && !full.includes('#') &&
-        !/\/exhibitions\/?($|\?)/.test(new URL(full).pathname) &&
-        !full.includes('/about') && !full.includes('/contact') &&
-        !full.includes('/members') && full !== 'https://www.hk-aga.org/' &&
-        full !== 'https://www.hk-aga.org') {
+    // Only enqueue exhibition detail pages like /exhibitions/123
+    if (/hk-aga\.org\/exhibitions\/\d+/.test(full)) {
       links.add(full);
     }
   });
@@ -311,9 +308,10 @@ const crawler = new CheerioCrawler({
         }
         const cards = extractHkAgaCards($, url);
         if (cards.length > 0) events.push(...cards);
-      } else {
+      } else if (/\/exhibitions\/\d+/.test(url)) {
         events = extractHkAgaDetail($, url);
       }
+      // else: skip non-exhibition HK-AGA pages (galleries, login, etc.)
     } else {
       events = extractJsonLdEvents($, url);
     }
