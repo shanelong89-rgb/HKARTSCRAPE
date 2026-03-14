@@ -1,336 +1,340 @@
-// CULTIVE HK Events Apify Actor
-// Deploy on Apify (js-crawlee-cheerio template) to scrape HK events.
-// Output format matches CULTIVE's import pipeline exactly.
-//
-// Template: https://console.apify.com/actors/templates/js-crawlee-cheerio
+// CULTIVE HK Events Apify Actor v2.2
+// v2.2: Removed Time Out, focused on Eventbrite HK + HK-AGA
+// v2.1: Fixed listing page short-circuit, tag pill extraction
+// Deploy: push to GitHub -> Apify Console -> Rebuild -> Start
 
 import { CheerioCrawler, Dataset } from '@crawlee/cheerio';
 import { Actor } from 'apify';
-import { setTimeout } from 'node:timers/promises';
-
 await Actor.init();
 
-// Graceful abort handling
-Actor.on('aborting', async () => {
-    await setTimeout(1000);
-    await Actor.exit();
-});
-
-// ── Input Configuration ──────────────────────────────────────
 const {
-    startUrls = [
-        'https://www.lifestyleasia.com/hk/whats-on/events-whats-on/',
-        'https://www.timeout.com/hong-kong/things-to-do/things-to-do-in-hong-kong-this-weekend',
-    ],
-    maxRequestsPerCrawl = 100,
-    followLinks = true,
+  startUrls = [
+    'https://www.eventbrite.hk/d/hong-kong/events/',
+    'https://www.eventbrite.hk/d/hong-kong/music--events/',
+    'https://www.eventbrite.hk/d/hong-kong/food-and-drink--events/',
+    'https://www.eventbrite.hk/d/hong-kong/arts--events/',
+    'https://www.hk-aga.org/exhibitions',
+  ],
+  maxRequestsPerCrawl = 80,
 } = (await Actor.getInput()) ?? {};
 
-const proxyConfiguration = await Actor.createProxyConfiguration({ checkAccess: true });
+const proxyConfig = await Actor.createProxyConfiguration({ checkAccess: true });
+const seen = new Set();
 
 // ── Helpers ──────────────────────────────────────────────────
 
-/** Try multiple selectors and return the first non-empty text */
-function tryText($el, selectors) {
-    for (const sel of selectors) {
-        const text = $el.find(sel).first().text().trim();
-        if (text && text.length > 1) return text;
-    }
-    return '';
+function tryText($el, sels) {
+  for (const s of sels) {
+    const t = $el.find(s).first().text().trim();
+    if (t && t.length > 1) return t;
+  }
+  return '';
 }
 
-/** Try to extract an image URL */
-function tryImage($el) {
-    const img = $el.find('img').first();
-    return img.attr('src') || img.attr('data-src') || img.attr('data-lazy-src') || '';
-}
-
-/** Resolve relative URLs */
 function resolveUrl(url, base) {
-    if (!url) return '';
-    if (url.startsWith('http')) return url;
-    try {
-        return new URL(url, base).href;
-    } catch {
-        return url;
-    }
+  if (!url) return '';
+  if (url.startsWith('http')) return url;
+  try { return new URL(url, base).href; } catch { return url; }
 }
 
-/** Detect HK district from text */
+function normalizeDate(text) {
+  if (!text) return '';
+  if (/^\d{4}-\d{2}-\d{2}/.test(text)) return text;
+  const until = text.match(/until\s+(\d{1,2}\s+\w+\s+\d{4})/i);
+  if (until) { const d = new Date(until[1]); if (!isNaN(d)) return d.toISOString().split('T')[0]; }
+  const range = text.match(/(\d{1,2})\s+(\w{3,9})\s*[-]\s*\d{1,2}\s+\w{3,9},?\s*(\d{4})/);
+  if (range) { const d = new Date(range[1]+' '+range[2]+' '+range[3]); if (!isNaN(d)) return d.toISOString().split('T')[0]; }
+  try { const d = new Date(text); if (!isNaN(d) && d.getFullYear() > 2020) return d.toISOString().split('T')[0]; } catch {}
+  return text;
+}
+
+const HK_DISTRICTS = [
+  'Central','Wan Chai','Causeway Bay','Admiralty','Sheung Wan',
+  'Tsim Sha Tsui','Mong Kok','Jordan','Sham Shui Po','Kowloon',
+  'Kwun Tong','Wong Tai Sin','Sha Tin','Tai Po','Tuen Mun',
+  'Yuen Long','Tsuen Wan','Sai Kung','Lantau','Aberdeen',
+  'Stanley','Kennedy Town','Sai Ying Pun','North Point',
+  'Quarry Bay','Tai Koo','Chai Wan','West Kowloon',
+  'Wong Chuk Hang','Hung Hom','Diamond Hill','Tai Kwun','PMQ',
+];
+
 function detectDistrict(text) {
-    const districts = [
-        'Central', 'Wan Chai', 'Causeway Bay', 'Admiralty', 'Sheung Wan',
-        'Tsim Sha Tsui', 'Mong Kok', 'Jordan', 'Sham Shui Po', 'Kowloon',
-        'Kwun Tong', 'Wong Tai Sin', 'Sha Tin', 'Tai Po', 'Tuen Mun',
-        'Yuen Long', 'Tsuen Wan', 'Sai Kung', 'Lantau', 'Aberdeen',
-        'Stanley', 'Repulse Bay', 'Happy Valley', 'Kennedy Town',
-        'Sai Ying Pun', 'North Point', 'Quarry Bay', 'Tai Koo',
-        'Chai Wan', 'Shek Tong Tsui', 'Mid-Levels', 'The Peak',
-        'Discovery Bay', 'Tung Chung', 'Hung Hom', 'To Kwa Wan',
-        'Whampoa', 'Diamond Hill', 'Lok Fu', 'Cheung Sha Wan',
-        'Lai Chi Kok', 'Mei Foo', 'Olympic', 'West Kowloon',
-    ];
-    const lower = text.toLowerCase();
-    return districts.find((d) => lower.includes(d.toLowerCase())) || '';
+  const lower = text.toLowerCase();
+  return HK_DISTRICTS.find(d => lower.includes(d.toLowerCase())) || '';
 }
 
-/** Detect event category from text */
+const CATEGORY_KEYWORDS = {
+  Music: ['concert','music','dj','live band','gig','jazz','orchestra'],
+  Art: ['art','exhibition','gallery','museum','sculpture','painting'],
+  'Food & Drink': ['food','dining','brunch','cocktail','wine','beer','tasting'],
+  Nightlife: ['club','nightclub','party','nightlife','rave'],
+  Wellness: ['yoga','meditation','wellness','fitness','sound bath'],
+  Film: ['film','movie','cinema','screening'],
+  Theatre: ['theatre','theater','performance','dance','ballet','comedy'],
+  Sports: ['sport','run','marathon','hike','hiking','cycling'],
+  Markets: ['market','flea','bazaar','fair','craft'],
+  Community: ['community','charity','volunteer','meetup','workshop'],
+};
+
 function detectCategory(text) {
-    const categories = {
-        'Music': ['concert', 'music', 'dj', 'live band', 'gig', 'festival', 'rave', 'jazz', 'hip hop', 'electronic'],
-        'Art': ['art', 'exhibition', 'gallery', 'museum', 'sculpture', 'painting', 'installation'],
-        'Food & Drink': ['food', 'restaurant', 'dining', 'brunch', 'cocktail', 'wine', 'beer', 'tasting', 'bar'],
-        'Nightlife': ['club', 'nightclub', 'party', 'nightlife', 'lounge', 'rooftop'],
-        'Wellness': ['yoga', 'meditation', 'wellness', 'fitness', 'spa', 'retreat', 'workshop'],
-        'Film': ['film', 'movie', 'cinema', 'screening', 'documentary'],
-        'Theatre': ['theatre', 'theater', 'performance', 'dance', 'ballet', 'opera', 'comedy', 'stand-up'],
-        'Sports': ['sport', 'run', 'marathon', 'rugby', 'football', 'tennis', 'hike', 'hiking', 'cycling'],
-        'Markets': ['market', 'flea', 'bazaar', 'fair', 'pop-up'],
-        'Community': ['community', 'charity', 'volunteer', 'meetup', 'networking', 'social'],
-    };
-    const lower = text.toLowerCase();
-    for (const [cat, keywords] of Object.entries(categories)) {
-        if (keywords.some((kw) => lower.includes(kw))) return cat;
-    }
-    return 'Events';
+  const lower = text.toLowerCase();
+  for (const [cat, kws] of Object.entries(CATEGORY_KEYWORDS))
+    if (kws.some(k => lower.includes(k))) return cat;
+  return 'Events';
 }
 
-/** Detect experience modes from text */
 function detectModes(text) {
-    const modes = [];
-    const lower = text.toLowerCase();
-    if (['outdoor', 'rooftop', 'garden', 'beach', 'park', 'harbour'].some((k) => lower.includes(k))) modes.push('Outdoor');
-    if (['indoor', 'gallery', 'museum', 'theatre', 'cinema', 'restaurant'].some((k) => lower.includes(k))) modes.push('Indoor');
-    if (['free', 'no cover', 'complimentary'].some((k) => lower.includes(k))) modes.push('Free');
-    if (['family', 'kid', 'children'].some((k) => lower.includes(k))) modes.push('Family-Friendly');
-    if (['date', 'romantic', 'couples'].some((k) => lower.includes(k))) modes.push('Date Night');
-    return modes.length > 0 ? modes : ['Indoor'];
+  const modes = [], lower = text.toLowerCase();
+  if (['outdoor','rooftop','garden','beach','park','terrace'].some(k => lower.includes(k))) modes.push('Outdoor');
+  if (['indoor','gallery','museum','theatre','cinema','studio'].some(k => lower.includes(k))) modes.push('Indoor');
+  if (['free','no cover','complimentary'].some(k => lower.includes(k))) modes.push('Free');
+  if (['family','kid','children'].some(k => lower.includes(k))) modes.push('Family-Friendly');
+  return modes.length > 0 ? modes : ['Indoor'];
 }
 
-// ── Site-Specific Handlers ───────────────────────────────────
+// ── CULTIVE Field Mapping ────────────────────────────────────
+// Maps source field name variants to CULTIVE import schema:
+//   title <- title|name|eventTitle
+//   date  <- date|startDate|eventDate   venueName <- venueName|venue|locationName|place
+//   image <- image|imageUrl|photo|thumbnail|flyerFront
+//   price <- price|cost|ticketPrice     address <- address|location|fullAddress
+//   lat/lng <- lat/lng|latitude/longitude|geo.*|coordinates.*
+//   artists <- artists (array or comma-separated string)
 
-function isLifestyleAsia(url) {
-    return url.includes('lifestyleasia.com');
+function mapToCultiveSchema(raw, url) {
+  const r = raw || {};
+  const title = r.title || r.name || r.eventTitle || '';
+  const date = normalizeDate(r.date || r.startDate || r.eventDate || '');
+  const time = r.time || r.startTime || '';
+  const venueName = r.venueName || r.venue || r.locationName || r.place ||
+    (r.location && typeof r.location === 'object' ? r.location.name : '') || '';
+  const description = (r.description || r.text || r.content || r.summary || '').slice(0, 500);
+  const imgRaw = r.image || r.imageUrl || r.photo || r.thumbnail || r.flyerFront || '';
+  const image = typeof imgRaw === 'object' ? (imgRaw.url || imgRaw.src || '') : imgRaw;
+  const price = r.price || r.cost || r.ticketPrice ||
+    (r.offers && r.offers.price ? (r.offers.priceCurrency||'HKD')+' '+r.offers.price : '') || '';
+  let address = r.address || r.fullAddress || '';
+  if (!address && r.location) {
+    if (typeof r.location === 'string') address = r.location;
+    else if (r.location.address) address = typeof r.location.address === 'string'
+      ? r.location.address : r.location.address.streetAddress || '';
+  }
+  let lat = r.lat||r.latitude||null, lng = r.lng||r.longitude||null;
+  if (!lat && r.geo) { lat = r.geo.lat||r.geo.latitude||null; lng = r.geo.lng||r.geo.longitude||null; }
+  if (!lat && r.coordinates) { lat = r.coordinates.lat||null; lng = r.coordinates.lng||null; }
+  if (!lat && r.location?.geo) { lat = r.location.geo.latitude||null; lng = r.location.geo.longitude||null; }
+  let artists = r.artists || [];
+  if (typeof artists === 'string') artists = artists.split(',').map(a => a.trim()).filter(Boolean);
+  if (!Array.isArray(artists)) artists = [];
+  if (artists.length === 0 && r.performer) {
+    artists = Array.isArray(r.performer) ? r.performer.map(p => p.name||p) : r.performer.name ? [r.performer.name] : [];
+  }
+  const fullText = [title, description, venueName, address].join(' ');
+  return {
+    title, date, time, venueName, description,
+    image: resolveUrl(image, url), price, address,
+    lat: lat ? Number(lat) : null, lng: lng ? Number(lng) : null,
+    artists,
+    district: r.district || detectDistrict(fullText),
+    category: r.category || detectCategory(fullText),
+    modes: r.modes || detectModes(fullText),
+    sourceUrl: r.sourceUrl || r.url || url,
+    scrapedFrom: url, scrapedAt: new Date().toISOString(),
+  };
 }
 
-function isTimeOut(url) {
-    return url.includes('timeout.com');
-}
-
-function extractLifestyleAsiaEvents($, url) {
-    const events = [];
-    $('article, .post-card, .story-card, [class*="post-item"], [class*="article-card"]').each((i, el) => {
-        const $el = $(el);
-        const title = tryText($el, ['h2', 'h3', '.title', '.post-title', '.story-title', 'a[class*="title"]']);
-        if (!title || title.length < 5) return;
-
-        const link = $el.find('a').first().attr('href') || '';
-        const image = tryImage($el);
-        const dateText = tryText($el, ['time', '[class*="date"]', '.meta-date', '[datetime]']);
-        const description = tryText($el, ['p', '.excerpt', '.description', '.summary', '.dek']);
-
-        const fullText = title + ' ' + description;
-        events.push({
-            title,
-            date: dateText,
-            time: '',
-            venueName: '',
-            description,
-            image: resolveUrl(image, url),
-            price: '',
-            address: '',
-            lat: null,
-            lng: null,
-            artists: [],
-            district: detectDistrict(fullText),
-            category: detectCategory(fullText),
-            modes: detectModes(fullText),
-            sourceUrl: resolveUrl(link, url),
-            scrapedFrom: url,
-            scrapedAt: new Date().toISOString(),
-        });
-    });
-    return events;
-}
-
-function extractTimeOutEvents($, url) {
-    const events = [];
-    $('article, [class*="card"], [class*="tile"], [class*="listing-item"], li[class*="event"]').each((i, el) => {
-        const $el = $(el);
-        const title = tryText($el, ['h2', 'h3', '.card-title', '[class*="title"]', 'a']);
-        if (!title || title.length < 5) return;
-
-        const link = $el.find('a').first().attr('href') || '';
-        const image = tryImage($el);
-        const dateText = tryText($el, ['time', '[class*="date"]', '[class*="when"]', '.meta']);
-        const venue = tryText($el, ['[class*="venue"]', '[class*="location"]', '[class*="place"]']);
-        const description = tryText($el, ['p', '.summary', '.description', '.excerpt']);
-        const price = tryText($el, ['[class*="price"]', '[class*="cost"]']);
-
-        const fullText = title + ' ' + description + ' ' + venue;
-        events.push({
-            title,
-            date: dateText,
-            time: '',
-            venueName: venue,
-            description,
-            image: resolveUrl(image, url),
-            price,
-            address: '',
-            lat: null,
-            lng: null,
-            artists: [],
-            district: detectDistrict(fullText),
-            category: detectCategory(fullText),
-            modes: detectModes(fullText),
-            sourceUrl: resolveUrl(link, url),
-            scrapedFrom: url,
-            scrapedAt: new Date().toISOString(),
-        });
-    });
-    return events;
-}
-
-/** Generic fallback extractor */
-function extractGenericEvents($, url) {
-    const events = [];
-    $('article, [class*="event"], [class*="card"], [class*="listing"]').each((i, el) => {
-        const $el = $(el);
-        const title = tryText($el, ['h1', 'h2', 'h3', '.title', '[class*="title"]', 'a']);
-        if (!title || title.length < 5) return;
-
-        const link = $el.find('a').first().attr('href') || '';
-        const image = tryImage($el);
-        const dateText = tryText($el, ['time', '[class*="date"]', '.date']);
-        const venue = tryText($el, ['[class*="venue"]', '[class*="location"]']);
-        const description = tryText($el, ['p', '.description', '.excerpt']);
-        const price = tryText($el, ['[class*="price"]', '[class*="cost"]']);
-
-        const fullText = title + ' ' + description + ' ' + venue;
-        events.push({
-            title,
-            date: dateText,
-            time: '',
-            venueName: venue,
-            description: description.slice(0, 500),
-            image: resolveUrl(image, url),
-            price,
-            address: '',
-            lat: null,
-            lng: null,
-            artists: [],
-            district: detectDistrict(fullText),
-            category: detectCategory(fullText),
-            modes: detectModes(fullText),
-            sourceUrl: resolveUrl(link, url),
-            scrapedFrom: url,
-            scrapedAt: new Date().toISOString(),
-        });
-    });
-    return events;
-}
-
-// ── Also try JSON-LD structured data ─────────────────────────
+// ── JSON-LD extraction ───────────────────────────────────────
 
 function extractJsonLdEvents($, url) {
-    const events = [];
-    $('script[type="application/ld+json"]').each((i, el) => {
-        try {
-            const data = JSON.parse($(el).html());
-            const items = Array.isArray(data) ? data : data['@graph'] ? data['@graph'] : [data];
-            for (const item of items) {
-                if (item['@type'] !== 'Event') continue;
-                const title = item.name || '';
-                if (!title) continue;
-                const fullText = title + ' ' + (item.description || '') + ' ' + (item.location?.name || '');
-                events.push({
-                    title,
-                    date: item.startDate || '',
-                    time: item.startDate ? new Date(item.startDate).toLocaleTimeString() : '',
-                    venueName: item.location?.name || '',
-                    description: (item.description || '').slice(0, 500),
-                    image: item.image?.url || item.image || '',
-                    price: item.offers?.price ? `${item.offers.priceCurrency || 'HKD'} ${item.offers.price}` : '',
-                    address: item.location?.address?.streetAddress || item.location?.address || '',
-                    lat: item.location?.geo?.latitude || null,
-                    lng: item.location?.geo?.longitude || null,
-                    artists: item.performer
-                        ? (Array.isArray(item.performer) ? item.performer.map((p) => p.name) : [item.performer.name])
-                        : [],
-                    district: detectDistrict(fullText),
-                    category: detectCategory(fullText),
-                    modes: detectModes(fullText),
-                    sourceUrl: item.url || url,
-                    scrapedFrom: url,
-                    scrapedAt: new Date().toISOString(),
-                });
-            }
-        } catch (e) {
-            // ignore invalid JSON-LD
-        }
+  const events = [];
+  $('script[type="application/ld+json"]').each((i, el) => {
+    try {
+      const data = JSON.parse($(el).html());
+      const items = Array.isArray(data) ? data : data['@graph'] ? data['@graph'] : [data];
+      for (const item of items) {
+        if (item['@type'] !== 'Event' || !item.name) continue;
+        events.push(mapToCultiveSchema({
+          title: item.name, startDate: item.startDate,
+          venueName: item.location?.name || '',
+          description: item.description || '', image: item.image,
+          address: item.location?.address?.streetAddress || '',
+          lat: item.location?.geo?.latitude, lng: item.location?.geo?.longitude,
+          performer: item.performer, sourceUrl: item.url || url,
+          price: item.offers?.price ? (item.offers.priceCurrency||'HKD')+' '+item.offers.price : '',
+        }, url));
+      }
+    } catch {}
+  });
+  return events;
+}
+
+// ── Eventbrite ───────────────────────────────────────────────
+
+function isEventbrite(url) { return url.includes('eventbrite.hk') || url.includes('eventbrite.com'); }
+
+function extractEventbriteListingLinks($, url) {
+  const links = new Set();
+  $('a[href*="/e/"]').each((i, el) => {
+    const href = $(el).attr('href');
+    if (href && href.includes('/e/')) links.add(resolveUrl(href, url));
+  });
+  return [...links];
+}
+
+function extractEventbriteDetail($, url) {
+  const title = $('h1').first().text().trim() || $('meta[property="og:title"]').attr('content') || '';
+  if (!title || title.length < 5) return [];
+  return [mapToCultiveSchema({
+    title,
+    description: $('meta[property="og:description"]').attr('content') || '',
+    image: $('meta[property="og:image"]').attr('content') || '',
+    date: $('time').first().attr('datetime') || tryText($('body'), ['[class*="date"]','time']),
+    time: tryText($('body'), ['[class*="time"]','[class*="event-time"]']),
+    venueName: tryText($('body'), ['[class*="location-info"] p','[class*="venue"]']),
+    address: tryText($('body'), ['[class*="address"]','[class*="venue-address"]']),
+    price: tryText($('body'), ['[class*="ticket-price"]','[class*="price"]']),
+    sourceUrl: url,
+  }, url)];
+}
+
+// ── HK Art Gallery Association ───────────────────────────────
+
+function isHkAga(url) { return url.includes('hk-aga.org'); }
+
+function isHkAgaListing(url) {
+  return /\/exhibitions\/?($|\?)/.test(new URL(url).pathname + new URL(url).search);
+}
+
+function extractHkAgaLinks($, url) {
+  const links = new Set();
+  $('a[href]').each((i, el) => {
+    const href = $(el).attr('href');
+    if (!href) return;
+    const full = resolveUrl(href, url);
+    if (full.includes('hk-aga.org') && full !== url && !full.includes('#') &&
+        !/\/exhibitions\/?($|\?)/.test(new URL(full).pathname) &&
+        !full.includes('/about') && !full.includes('/contact') &&
+        !full.includes('/members') && full !== 'https://www.hk-aga.org/' &&
+        full !== 'https://www.hk-aga.org') {
+      links.add(full);
+    }
+  });
+  return [...links];
+}
+
+function extractHkAgaCards($, url) {
+  const events = [];
+  const selectors = ['[class*="exhibition"]','article','.card','.item','.grid-item','.col'];
+  for (const sel of selectors) {
+    const cards = $(sel);
+    if (cards.length < 2) continue;
+    cards.each((i, el) => {
+      const $c = $(el), text = $c.text();
+      let title = '';
+      $c.find('h2,h3,h4,strong,[class*="title"]').each((j, h) => {
+        const t = $(h).text().trim();
+        if (t && t.length > 2 && t !== t.toUpperCase() && !title) title = t;
+      });
+      if (!title) title = $c.find('h2,h3,h4').first().text().trim();
+      if (!title || title.length < 3) return;
+      let district = '';
+      $c.find('span,div,p').each((j, e2) => {
+        const t = $(e2).text().trim();
+        if (t && t.length > 2 && t.length < 40 && t === t.toUpperCase() && !district) district = t;
+      });
+      const dateMatch = text.match(/(\d{1,2}\s+\w{3,9}\s*[-]\s*\d{1,2}\s+\w{3,9},?\s*\d{4})/);
+      const image = $c.find('img').first().attr('src') || '';
+      const link = $c.find('a').first().attr('href') || '';
+      events.push(mapToCultiveSchema({
+        title, date: dateMatch ? dateMatch[1] : '', image,
+        district: detectDistrict(district) || district,
+        category: 'Art', modes: ['Indoor'],
+        sourceUrl: link ? resolveUrl(link, url) : url,
+      }, url));
     });
-    return events;
+    if (events.length > 0) break;
+  }
+  return events;
+}
+
+function extractHkAgaDetail($, url) {
+  const title = $('h1').first().text().trim() || $('h2').first().text().trim();
+  if (!title || title.length < 3) return [];
+  const body = $('body').text();
+  const dateMatch = body.match(/(\d{1,2}\s+\w{3,9}\s*[-]\s*\d{1,2}\s+\w{3,9},?\s*\d{4})/);
+  let desc = '';
+  $('article p, main p, .content p').each((i, el) => {
+    if (desc.length < 500) { const t = $(el).text().trim(); if (t.length > 20) desc += (desc ? ' ' : '') + t; }
+  });
+  if (!desc) desc = $('meta[property="og:description"]').attr('content') || '';
+  const image = $('meta[property="og:image"]').attr('content') || $('article img').first().attr('src') || '';
+  const addrMatch = body.match(/Address:\s*(.+?)(?=\n|Phone:|Email:|$)/i);
+  return [mapToCultiveSchema({
+    title, date: $('time').first().attr('datetime') || (dateMatch ? dateMatch[1] : ''),
+    venueName: tryText($('body'), ['[class*="gallery"]','[class*="organizer"]','[class*="venue"]']),
+    description: desc, image,
+    address: addrMatch ? addrMatch[1].trim() : tryText($('body'), ['[class*="address"]']),
+    category: 'Art', modes: ['Indoor'], sourceUrl: url,
+  }, url)];
 }
 
 // ── Crawler ──────────────────────────────────────────────────
 
 const crawler = new CheerioCrawler({
-    proxyConfiguration,
-    maxRequestsPerCrawl,
-    async requestHandler({ request, $, log, enqueueLinks }) {
-        const url = request.url;
-        log.info(`Scraping: ${url}`);
+  proxyConfiguration: proxyConfig,
+  maxRequestsPerCrawl, maxRequestRetries: 2, requestHandlerTimeoutSecs: 30,
 
-        // 1. Try JSON-LD first (most reliable)
-        let events = extractJsonLdEvents($, url);
+  async requestHandler({ request, $, log }) {
+    const url = request.url;
+    if (['/news/','/jobs/','/newsletter','/search','/shopping/'].some(p => url.includes(p))) return;
+    log.info('Scraping: ' + url);
+    let events = [];
 
-        // 2. If no JSON-LD events, try site-specific extractors
-        if (events.length === 0) {
-            if (isLifestyleAsia(url)) {
-                events = extractLifestyleAsiaEvents($, url);
-            } else if (isTimeOut(url)) {
-                events = extractTimeOutEvents($, url);
-            } else {
-                events = extractGenericEvents($, url);
-            }
+    if (isEventbrite(url)) {
+      if (url.includes('/e/')) {
+        events = extractJsonLdEvents($, url);
+        if (events.length === 0) events = extractEventbriteDetail($, url);
+      } else {
+        const links = extractEventbriteListingLinks($, url);
+        if (links.length > 0) {
+          await crawler.addRequests(links.map(u => ({ url: u })));
+          log.info('Enqueued ' + links.length + ' Eventbrite event pages');
         }
-
-        // 3. Deduplicate by title
-        const seen = new Set();
-        const unique = events.filter((e) => {
-            const key = e.title.toLowerCase();
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-
-        if (unique.length > 0) {
-            await Dataset.pushData(unique);
-            log.info(`Extracted ${unique.length} events from ${url}`);
-        } else {
-            log.warning(`No events found on ${url}`);
+        return;
+      }
+    } else if (isHkAga(url)) {
+      if (isHkAgaListing(url)) {
+        const links = extractHkAgaLinks($, url);
+        if (links.length > 0) {
+          await crawler.addRequests(links.map(u => ({ url: u })));
+          log.info('Enqueued ' + links.length + ' HK-AGA detail pages');
         }
+        const cards = extractHkAgaCards($, url);
+        if (cards.length > 0) events.push(...cards);
+      } else {
+        events = extractHkAgaDetail($, url);
+      }
+    } else {
+      events = extractJsonLdEvents($, url);
+    }
 
-        // Optionally follow links on the same domain
-        if (followLinks) {
-            await enqueueLinks({
-                globs: [
-                    'https://www.lifestyleasia.com/hk/whats-on/**',
-                    'https://www.timeout.com/hong-kong/**',
-                ],
-            });
-        }
-    },
-    failedRequestHandler({ request, log }) {
-        log.error(`Failed: ${request.url}`);
-    },
+    const unique = events.filter(e => {
+      const key = e.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (seen.has(key)) return false;
+      seen.add(key); return true;
+    });
+    if (unique.length > 0) {
+      await Dataset.pushData(unique);
+      log.info('Saved ' + unique.length + ' event(s)');
+    }
+  },
+
+  failedRequestHandler({ request, log }) {
+    log.error('Failed: ' + request.url);
+  },
 });
 
 await crawler.run(startUrls);
-
-// ── Summary ──────────────────────────────────────────────────
-const dataset = await Dataset.open();
-const info = await dataset.getInfo();
-console.log(`Done! Total events scraped: ${info?.itemCount ?? 0}`);
-
+const info = await (await Dataset.open()).getInfo();
+console.log('Done! Total events: ' + (info?.itemCount ?? 0));
 await Actor.exit();
