@@ -1,4 +1,6 @@
-// CULTIVE HK Events Apify Actor v2.5
+// CULTIVE HK Events Apify Actor v2.6
+// v2.6: Strip boilerplate from descriptions, date/endDate split, district
+//       normalization, default Free price, lowercase category, artist extraction
 // v2.5: Description extraction from DOM body text + Google Maps coords
 //       Address validation (must contain digits). 3-strategy desc fallback.
 // v2.4: HK-AGA detail page crawling with Wix JSON mining (desc=0, didn't work)
@@ -23,7 +25,7 @@ const {
 const proxyConfig = await Actor.createProxyConfiguration({ checkAccess: true });
 const seen = new Set();
 
-// ── Helpers ─────────────────────���──────────────────────────
+// ── Helpers ────────────────────────────────────────────────
 
 function tryText($el, sels) {
   for (const s of sels) {
@@ -50,6 +52,78 @@ function normalizeDate(text) {
   return text;
 }
 
+// Parse date ranges like "20 Mar - 20 May, 2026" into { date, endDate } ISO strings
+function parseDateRange(text) {
+  if (!text) return { date: '', endDate: '' };
+  const m = text.match(/(\d{1,2})\s+(\w{3,9})\s*[\-\u2013]\s*(\d{1,2})\s+(\w{3,9}),?\s*(\d{4})/);
+  if (m) {
+    const s = new Date(m[1]+' '+m[2]+' '+m[5]);
+    const e = new Date(m[3]+' '+m[4]+' '+m[5]);
+    if (!isNaN(s) && !isNaN(e)) return { date: s.toISOString().split('T')[0], endDate: e.toISOString().split('T')[0] };
+  }
+  return { date: normalizeDate(text), endDate: '' };
+}
+
+// Normalize HK-AGA uppercase district names to CULTIVE standard
+const DISTRICT_MAP = {
+  'SOUTHERN': 'Wong Chuk Hang',
+  'SAI WAN (WESTERN)': 'Kennedy Town',
+  'KWAI TSING': 'Kwai Chung',
+  'CENTRAL AND WESTERN': 'Central',
+  'WAN CHAI': 'Wan Chai',
+  'EASTERN': 'North Point',
+  'KOWLOON CITY': 'Kowloon',
+  'YAU TSIM MONG': 'Tsim Sha Tsui',
+  'SHAM SHUI PO': 'Sham Shui Po',
+  'SHA TIN': 'Sha Tin',
+  'TAI PO': 'Tai Po',
+  'TUEN MUN': 'Tuen Mun',
+  'YUEN LONG': 'Yuen Long',
+  'TSUEN WAN': 'Tsuen Wan',
+  'SAI KUNG': 'Sai Kung',
+  'ISLANDS': 'Lantau',
+  'NORTH': 'North Point',
+  'KWUN TONG': 'Kwun Tong',
+  'WONG TAI SIN': 'Wong Tai Sin',
+};
+
+function normalizeDistrict(raw, address) {
+  const upper = (raw || '').trim().toUpperCase();
+  if (DISTRICT_MAP[upper]) return DISTRICT_MAP[upper];
+  const fromAddr = detectDistrict(address || '');
+  if (fromAddr) return fromAddr;
+  const fromRaw = detectDistrict(raw || '');
+  if (fromRaw) return fromRaw;
+  return raw || '';
+}
+
+// Strip HK-AGA boilerplate footer text from descriptions
+function cleanDescription(desc) {
+  if (!desc) return '';
+  const markers = [
+    'Founded in 2012, the Hong Kong Art Gallery Association',
+    '/* real people should not fill this in',
+    'TEMPUS FUGIT',
+  ];
+  let clean = desc;
+  for (const marker of markers) {
+    const idx = clean.indexOf(marker);
+    if (idx > 0) clean = clean.slice(0, idx);
+  }
+  return clean.replace(/\s+/g, ' ').trim();
+}
+
+// Extract artist names from description text
+function extractArtists(desc) {
+  const artists = [];
+  const presented = desc.match(/[Aa]rtists?\s*(?:presented|featured|include)?\s*:\s*([^.]+)/);
+  if (presented) {
+    const names = presented[1].split(/,|\band\b/).map(n => n.trim()).filter(n => n.length > 2 && n.length < 60);
+    artists.push(...names);
+  }
+  return artists;
+}
+
 const HK_DISTRICTS = [
   'Central','Wan Chai','Causeway Bay','Admiralty','Sheung Wan',
   'Tsim Sha Tsui','Mong Kok','Jordan','Sham Shui Po','Kowloon',
@@ -66,32 +140,23 @@ function detectDistrict(text) {
 }
 
 const CATEGORY_KEYWORDS = {
-  Music: ['concert','music','dj','live band','gig','jazz','orchestra'],
-  Art: ['art','exhibition','gallery','museum','sculpture','painting'],
-  'Food & Drink': ['food','dining','brunch','cocktail','wine','beer','tasting'],
-  Nightlife: ['club','nightclub','party','nightlife','rave'],
-  Wellness: ['yoga','meditation','wellness','fitness','sound bath'],
-  Film: ['film','movie','cinema','screening'],
-  Theatre: ['theatre','theater','performance','dance','ballet','comedy'],
-  Sports: ['sport','run','marathon','hike','hiking','cycling'],
-  Markets: ['market','flea','bazaar','fair','craft'],
-  Community: ['community','charity','volunteer','meetup','workshop'],
+  music: ['concert','music','dj','live band','gig','jazz','orchestra'],
+  art: ['art','exhibition','gallery','museum','sculpture','painting'],
+  'food-and-drink': ['food','dining','brunch','cocktail','wine','beer','tasting'],
+  nightlife: ['club','nightclub','party','nightlife','rave'],
+  wellness: ['yoga','meditation','wellness','fitness','sound bath'],
+  film: ['film','movie','cinema','screening'],
+  theatre: ['theatre','theater','performance','dance','ballet','comedy'],
+  sports: ['sport','run','marathon','hike','hiking','cycling'],
+  markets: ['market','flea','bazaar','fair','craft'],
+  community: ['community','charity','volunteer','meetup','workshop'],
 };
 
 function detectCategory(text) {
   const lower = text.toLowerCase();
   for (const [cat, kws] of Object.entries(CATEGORY_KEYWORDS))
     if (kws.some(k => lower.includes(k))) return cat;
-  return 'Events';
-}
-
-function detectModes(text) {
-  const modes = [], lower = text.toLowerCase();
-  if (['outdoor','rooftop','garden','beach','park','terrace'].some(k => lower.includes(k))) modes.push('Outdoor');
-  if (['indoor','gallery','museum','theatre','cinema','studio'].some(k => lower.includes(k))) modes.push('Indoor');
-  if (['free','no cover','complimentary'].some(k => lower.includes(k))) modes.push('Free');
-  if (['family','kid','children'].some(k => lower.includes(k))) modes.push('Family-Friendly');
-  return modes.length > 0 ? modes : ['Indoor'];
+  return 'events';
 }
 
 // ── CULTIVE Field Mapping ────────────────────────────────────
@@ -99,7 +164,8 @@ function detectModes(text) {
 function mapToCultiveSchema(raw, url) {
   const r = raw || {};
   const title = r.title || r.name || r.eventTitle || '';
-  const date = normalizeDate(r.date || r.startDate || r.eventDate || '');
+  const dateRaw = r.date || r.startDate || r.eventDate || '';
+  const dates = parseDateRange(dateRaw);
   const time = r.time || r.startTime || '';
   const venueName = r.venueName || r.venue || r.locationName || r.place ||
     (r.location && typeof r.location === 'object' ? r.location.name : '') || '';
@@ -125,17 +191,18 @@ function mapToCultiveSchema(raw, url) {
     artists = Array.isArray(r.performer) ? r.performer.map(p => p.name||p) : r.performer.name ? [r.performer.name] : [];
   }
   const fullText = [title, description, venueName, address].join(' ');
-  return {
-    title, date, time, venueName, description,
+  const result = {
+    title, date: dates.date || normalizeDate(dateRaw), time, venueName, description,
     image: resolveUrl(image, url), price, address,
     lat: lat ? Number(lat) : null, lng: lng ? Number(lng) : null,
     artists,
     district: r.district || detectDistrict(fullText),
     category: r.category || detectCategory(fullText),
-    modes: r.modes || detectModes(fullText),
     sourceUrl: r.sourceUrl || r.url || url,
     scrapedFrom: url, scrapedAt: new Date().toISOString(),
   };
+  if (dates.endDate) result.endDate = dates.endDate;
+  return result;
 }
 
 // ── JSON-LD extraction ───────────────────────────────────────
@@ -194,9 +261,7 @@ function extractEventbriteDetail($, url) {
   if (venueEl.length) {
     venueName = venueEl.find('p').first().text().trim()
       || venueEl.find('strong').first().text().trim() || '';
-    // Cut before day-of-week to avoid "VenueCentral, HKIMonday Mar 30..."
     venueName = venueName.split(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?/)[0].trim();
-    // Remove trailing region codes
     venueName = venueName.replace(/,?\s*(?:HKI|KOW|NT|NTW)\s*$/, '').trim();
   }
 
@@ -233,13 +298,6 @@ function isHkAgaListing(url) {
   return /\/exhibitions\/?($|\?)/.test(new URL(url).pathname + new URL(url).search);
 }
 
-// HK-AGA listing page: each <a> wraps an entire card with structured text:
-//   Line 1: DISTRICT (all caps, e.g. "SAI WAN (WESTERN)")
-//   Line 2: Exhibition title
-//   Line 3: Date range (e.g. "14 Mar – 8 Apr, 2026")
-//   Line 4: Gallery/venue name
-//   Line 5: Type label (e.g. "Art Galleries" / "Art Spaces")
-// Parse this blob directly instead of traversing DOM containers.
 function extractHkAgaCards($, url) {
   const cards = [];
   const seen = new Set();
@@ -251,12 +309,10 @@ function extractHkAgaCards($, url) {
     if (seen.has(full)) return;
     seen.add(full);
 
-    // Split the link text blob into clean lines
     const rawText = $(el).text();
     const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
     if (lines.length < 2) return;
 
-    // Parse structured lines
     let district = '', title = '', date = '', venue = '', typeLabel = '';
 
     for (const line of lines) {
@@ -282,68 +338,57 @@ function extractHkAgaCards($, url) {
 }
 
 // Mine HK-AGA detail pages for description, address, coords
-// The Wix SPA DOES server-render body text, so we extract from DOM + body text
 function extractWixData($, url) {
   const result = { description: '', address: '', lat: null, lng: null };
   const body = $('body').text() || '';
 
-  // ── Address: find text after "Address:" label ──
-  // Use body text split by common field labels
+  // ── Address ──
   const addrMatch = body.match(/Address[:\s]+([^\n]+)/i);
   if (addrMatch) {
     let addr = addrMatch[1].trim();
-    // Stop before Phone/Email/Website labels if on same line
     addr = addr.split(/\s*(?:Phone|Email|Website|Tel)[:\s]/i)[0].trim();
-    // Avoid catching description text: valid addresses have numbers + road/street keywords
     if (/\d/.test(addr) && (addr.length < 200)) {
       result.address = addr;
     }
   }
 
-  // ── Description: collect substantial text paragraphs from DOM ──
-  // Strategy A: Find all text nodes > 80 chars that look like descriptions
+  // ── Description: Strategy A ──
   const descParts = [];
   $('p, div, span').each((i, el) => {
     const text = $(el).clone().children().remove().end().text().trim();
     if (text.length < 80) return;
-    // Skip if it looks like address, title, date, nav, or boilerplate
     if (/^Address|^Phone|^Email|^Website|^Click here|FILTER|CURRENTLY|UPCOMING/i.test(text)) return;
-    if (/^\d{1,2}\s+\w{3,9}\s*[\-\u2013]/.test(text)) return; // date range
-    if (text === text.toUpperCase() && text.length < 50) return; // district label
+    if (/^\d{1,2}\s+\w{3,9}\s*[\-\u2013]/.test(text)) return;
+    if (text === text.toUpperCase() && text.length < 50) return;
     descParts.push(text);
   });
 
   if (descParts.length > 0) {
-    // Concatenate all description paragraphs, deduplicate overlaps
     descParts.sort((a, b) => b.length - a.length);
-    // Filter out parts that are substrings of longer parts
     const unique = descParts.filter((p, i) => !descParts.slice(0, i).some(longer => longer.includes(p)));
-    result.description = unique.join(' ').replace(/\\s+/g, ' ').trim();
+    result.description = unique.join(' ').replace(/\s+/g, ' ').trim();
   }
 
-  // Strategy B: If no long paragraphs found, try extracting text between
-  // the header section and "Click here" / "Address:" markers
+  // Strategy B
   if (!result.description) {
     const clickIdx = body.indexOf('Click here');
     const addrIdx = body.indexOf('Address');
     const endIdx = clickIdx > 0 ? clickIdx : (addrIdx > 0 ? addrIdx : body.length);
-    // Skip the first ~100 chars (title, date, venue header)
     const chunk = body.slice(Math.min(150, endIdx), endIdx).trim();
     if (chunk.length > 80) {
-      result.description = chunk.replace(/\\s+/g, ' ').trim();
+      result.description = chunk.replace(/\s+/g, ' ').trim();
     }
   }
 
-  // Strategy C: og:description meta tag
+  // Strategy C: og:description
   if (!result.description) {
     const ogDesc = ($('meta[property="og:description"]').attr('content') || '').trim();
     if (ogDesc && ogDesc.length > 30) result.description = ogDesc;
   }
 
-  // ── Coordinates: from Google Maps iframe/embed URL ──
+  // ── Coordinates ──
   $('iframe[src*="maps"], iframe[src*="google"]').each((i, el) => {
     const src = $(el).attr('src') || '';
-    // Pattern: q=LAT,LNG or @LAT,LNG or ll=LAT,LNG or center=LAT,LNG
     const coordMatch = src.match(/(?:q=|@|ll=|center=)([0-9.]+)[,]([0-9.]+)/);
     if (coordMatch && !result.lat) {
       result.lat = Number(coordMatch[1]);
@@ -351,7 +396,6 @@ function extractWixData($, url) {
     }
   });
 
-  // Also try script tags for embedded coordinates
   if (!result.lat) {
     $('script').each((i, el) => {
       const text = $(el).html() || '';
@@ -394,33 +438,36 @@ const crawler = new CheerioCrawler({
       }
     } else if (isHkAga(url)) {
       if (isHkAgaListing(url)) {
-        // Extract card data and enqueue detail pages for descriptions
         const cards = extractHkAgaCards($, url);
         log.info('Found ' + cards.length + ' HK-AGA exhibition cards');
 
         if (cards.length > 0) {
-          // Enqueue detail pages with card context
           await crawler.addRequests(cards.map(c => ({
             url: c.url,
             userData: { hkAga: c },
           })));
           log.info('Enqueued ' + cards.length + ' HK-AGA detail pages for descriptions');
         }
-        return; // Don't save yet — wait for detail pages
+        return;
       } else {
         // Detail page: merge card data with Wix embedded data
         const card = request.userData?.hkAga || {};
         const wix = extractWixData($, url);
-        log.info('HK-AGA detail: desc=' + wix.description.length + ' chars, addr=' + (wix.address || 'none'));
+        const desc = cleanDescription(wix.description);
+        const artists = extractArtists(wix.description);
+        const district = normalizeDistrict(card.district || '', wix.address || '');
+        log.info('HK-AGA detail: desc=' + desc.length + ' chars, addr=' + (wix.address || 'none'));
 
         events = [mapToCultiveSchema({
           title: card.title || '', date: card.date || '',
           venueName: card.venue || '',
-          district: detectDistrict((card.district || '') + ' ' + (card.venue || '')) || card.district || '',
+          district: district,
           image: card.image || '',
-          description: wix.description, address: wix.address,
+          description: desc, address: wix.address,
           lat: wix.lat, lng: wix.lng,
-          category: 'Art', modes: ['Indoor'],
+          artists: artists,
+          price: 'Free',
+          category: 'art',
           sourceUrl: url,
         }, url)];
       }
